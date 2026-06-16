@@ -789,8 +789,7 @@ build_and_start() {
     fi
     log_ok "Build complete"
 
-    # --- Start postgres and redis FIRST, wait for them, then start web ------
-    # Starting everything at once risks web crashing before postgres is ready.
+    # --- Start postgres and redis FIRST ---------------------------------------
     log_step "Step 7: Starting infrastructure (postgres, redis)"
     $dc up -d postgres redis || die "Failed to start postgres/redis"
     log_ok "postgres and redis started"
@@ -805,7 +804,8 @@ build_and_start() {
     done
     log_ok "PostgreSQL accepting connections"
 
-    # Create canvas role if Canvas's init scripts didn't
+    # Ensure the canvas role exists — Canvas's postgres init scripts are
+    # unreliable across versions so we create/update it ourselves.
     sleep 5
     log_info "Ensuring canvas database role exists..."
     $dc exec -T postgres psql -U postgres -c "
@@ -819,54 +819,52 @@ build_and_start() {
     " || die "Failed to create canvas postgres role"
     log_ok "canvas role ready"
 
-    # --- Now start web and jobs -----------------------------------------------
-    log_step "Step 8: Starting web and jobs containers"
-    $dc up -d web jobs || die "Failed to start web/jobs"
+    # --- Setup via run --rm (temporary containers) ----------------------------
+    # We deliberately do NOT start the web container yet. All setup tasks run
+    # in temporary containers (run --rm) that are destroyed when they finish.
+    # The serving web container then starts fresh via up -d with no prior state:
+    # no stale PID files, no old unix sockets, no leftover nginx processes.
+    # Running setup inside an already-serving container (exec approach) leaves
+    # that state behind and causes nginx to fail when restarted.
+    #
+    # bundler-multilock is a Bundler plugin stored in the container's home dir.
+    # It does not live on the mounted volume, so it vanishes when a container
+    # exits. We reinstall it at the start of each run --rm bash -c block.
+    #
+    # --no-deps: postgres and redis are already running; skip dependency checks.
 
-    # Wait for web container to accept exec commands
-    local web_waited=0
-    until $dc exec -T web echo "ok" &>/dev/null; do
-        sleep 3; web_waited=$((web_waited + 3))
-        log_info "  ${web_waited}s..."
-        [[ $web_waited -ge 120 ]] && die "Web container never became ready. Check: $dc logs web"
-    done
-    log_ok "Web container ready"
-
-    # --- Install bundler-multilock ONCE in the running container --------------
-    # exec reuses the same running container filesystem, so the plugin
-    # installed here persists for all subsequent exec calls below.
-    log_info "Installing bundler-multilock plugin..."
-    $dc exec -T web bundle plugin install bundler-multilock 2>/dev/null || true
-
-    # --- Assets ---------------------------------------------------------------
-    log_step "Step 9: Installing Ruby gems and frontend assets  (slow)"
-    $dc exec -T --workdir /usr/src/app web ./script/install_assets.sh \
-        || die "install_assets.sh failed"
+    log_step "Step 8: Installing Ruby gems and frontend assets  (slow)"
+    $dc run --rm --no-deps web bash -c "
+        set -e
+        bundle plugin install bundler-multilock || true
+        ./script/install_assets.sh
+    " || die "install_assets.sh failed"
     log_ok "Assets installed"
 
-    # --- Database setup -------------------------------------------------------
-    log_step "Step 10: Creating and seeding the database"
-    $dc exec -T web bash -c "RAILS_ENV=development bundle exec rake db:create db:initial_setup" \
-        || die "Database setup failed"
+    log_step "Step 9: Creating and seeding the database"
+    $dc run --rm --no-deps web bash -c "
+        set -e
+        bundle plugin install bundler-multilock || true
+        RAILS_ENV=development bundle exec rake db:create db:initial_setup
+    " || die "Database setup failed"
     log_ok "Database created and seeded"
 
-    $dc exec -T web bash -c "RAILS_ENV=test bundle exec rake db:migrate" 2>/dev/null \
-        || log_warn "Test DB migration skipped (non-fatal)"
+    $dc run --rm --no-deps web bash -c "
+        bundle plugin install bundler-multilock || true
+        RAILS_ENV=test bundle exec rake db:migrate
+    " 2>/dev/null || log_warn "Test DB migration skipped (non-fatal)"
 
-    # --- Restart web and jobs -------------------------------------------------
-    # Passenger starts when the container first launches, before the database
-    # is seeded. A restart here ensures it picks up the fully seeded DB and
-    # compiled assets cleanly, so the browser actually gets a working Canvas.
-    log_step "Step 11: Restarting web services"
-    $dc restart web jobs || die "Failed to restart web/jobs"
-    log_ok "web and jobs restarted"
+    # --- Start all services ---------------------------------------------------
+    # The web container starts here for the FIRST time as a serving container.
+    # The volumes already have compiled assets and a fully seeded database.
+    # There is no prior nginx or Passenger state to interfere with startup.
+    log_step "Step 10: Starting all Canvas services"
+    $dc up -d || die "Failed to start Canvas services"
+    log_ok "All services started"
 
     # --- Wait for Passenger to signal ready -----------------------------------
-    # Passenger logs "Passenger core online" the instant it has bound its socket
-    # and is ready to accept connections. We stream the container logs and break
-    # the moment that line appears — no polling interval, no arbitrary sleep.
-    # --tail 0 means we only see lines produced after we start following, so
-    # we don't match stale output from before the restart.
+    # Passenger logs "Passenger core online" the instant it has bound its socket.
+    # --tail 0 ensures we only see lines from this fresh startup, not old output.
     log_step "Waiting for Passenger to come online..."
     local passenger_ready=false
     while IFS= read -r log_line; do
@@ -877,12 +875,161 @@ build_and_start() {
     done < <(timeout 180 $dc logs --follow --tail 0 web 2>&1 || true)
 
     if [[ "$passenger_ready" == true ]]; then
-        log_ok "Canvas is live at http://localhost:${PORT}"
+        log_ok "Passenger online"
     else
         log_warn "Passenger did not signal ready within 3 minutes."
-        log_warn "Canvas may still be starting up — check: $dc logs web"
-        log_warn "Then try: http://localhost:${PORT}"
+        log_warn "Check: $dc logs web"
     fi
+
+    # --- Verify HTTP is actually reachable ------------------------------------
+    # Passenger being online confirms the app layer started. This confirms
+    # nginx has bound to the port and is serving HTTP connections.
+    # curl returns 0 for any HTTP response (including 3xx/4xx/5xx) and
+    # non-zero only for network failures (refused, timeout) — which is exactly
+    # what we want: we are verifying the port is bound, not that Canvas is happy.
+    log_step "Verifying HTTP connectivity on port ${PORT}..."
+    local http_waited=0
+    until curl -s --connect-timeout 3 -o /dev/null "http://localhost:${PORT}" &>/dev/null; do
+        sleep 3; http_waited=$((http_waited + 3))
+        log_info "  ${http_waited}s..."
+        if [[ $http_waited -ge 60 ]]; then
+            log_warn "Port ${PORT} not responding after 60s. Diagnostics:"
+            log_warn "  $dc ps"
+            log_warn "  $dc logs --tail 40 web"
+            break
+        fi
+    done
+
+    if [[ $http_waited -lt 60 ]]; then
+        log_ok "Canvas is live at http://localhost:${PORT}"
+    fi
+}
+
+
+# =============================================================================
+# STEP A — Configure UFW firewall
+#
+# Docker bypasses UFW by directly manipulating iptables. This means Canvas's
+# web port is reachable from the network even if UFW has no explicit rule.
+# We add a rule anyway so the firewall's own rule list is consistent and
+# auditable, and so tools that inspect UFW rules see Canvas listed.
+#
+# Postgres (5432) and Redis (6379) are bound to 127.0.0.1 only in our
+# override — they are never exposed externally regardless of UFW.
+# =============================================================================
+configure_firewall() {
+    log_step "Step A: Firewall (UFW)"
+
+    if ! command -v ufw &>/dev/null; then
+        log_info "UFW not installed — no firewall configuration needed"
+        return 0
+    fi
+
+    local ufw_status
+    ufw_status=$(_sudo ufw status 2>/dev/null | head -1 || true)
+
+    if echo "$ufw_status" | grep -q "inactive"; then
+        log_info "UFW is installed but inactive — no rules needed"
+        return 0
+    fi
+
+    # UFW is active — add explicit allow rule for the Canvas web port
+    log_info "UFW is active — adding allow rule for port ${PORT}/tcp"
+    _sudo ufw allow "${PORT}/tcp" comment "Canvas LMS web" 2>/dev/null \
+        || log_warn "Could not add UFW rule — you may need to run: sudo ufw allow ${PORT}/tcp"
+
+    log_ok "UFW: port ${PORT}/tcp allowed"
+    log_info "Note: Docker bypasses UFW via iptables, so Canvas is already reachable."
+    log_info "      The rule above makes the allowance explicit and auditable."
+    log_info "      Postgres/Redis are bound to 127.0.0.1 — never exposed externally."
+}
+
+# =============================================================================
+# STEP B — Create and enable a systemd service for Canvas LMS
+#
+# Three-layer persistence on reboot:
+#
+#   Layer 1 — docker.service enabled:
+#     Docker daemon starts automatically on every boot.
+#     (Done in Step 1 via: systemctl enable docker)
+#
+#   Layer 2 — restart: unless-stopped in docker-compose.override.yml:
+#     If Docker restarts or the machine crashes, Docker automatically
+#     restarts any container that was running (not explicitly stopped).
+#     This covers unexpected reboots where systemd doesn't cleanly stop things.
+#
+#   Layer 3 — canvas-lms.service (this step):
+#     A proper systemd unit that starts Canvas after Docker and the network
+#     are fully ready. Provides clean systemctl management:
+#       sudo systemctl start   canvas-lms
+#       sudo systemctl stop    canvas-lms
+#       sudo systemctl restart canvas-lms
+#       sudo systemctl status  canvas-lms
+#       sudo systemctl disable canvas-lms   # stop auto-starting on boot
+#
+#   ExecStop uses "docker compose stop" (not "down") so containers are
+#   stopped but not removed. Layer 2 then handles crash recovery if Docker
+#   restarts without systemd involvement.
+# =============================================================================
+create_systemd_service() {
+    log_step "Step B: Creating canvas-lms systemd service"
+
+    local docker_bin
+    docker_bin="$(command -v docker || echo "/usr/bin/docker")"
+
+    local service_path="/etc/systemd/system/canvas-lms.service"
+
+    _sudo tee "$service_path" > /dev/null << EOF
+# canvas-lms.service — managed by canvas-setup.sh
+# Canvas LMS install: ${CANVAS_DIR}
+[Unit]
+Description=Canvas LMS (Docker Compose)
+Documentation=https://github.com/instructure/canvas-lms
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=${CANVAS_DIR}
+
+# Start: bring all Canvas containers up (idempotent — safe if already running)
+ExecStart=${docker_bin} compose \\
+    -f docker-compose.yml \\
+    -f docker-compose.override.yml \\
+    up -d
+
+# Stop: stop containers without removing them, so Docker's restart:unless-stopped
+# policy can recover from crashes without needing this service to run first.
+ExecStop=${docker_bin} compose \\
+    -f docker-compose.yml \\
+    -f docker-compose.override.yml \\
+    stop
+
+# Reload: restart web and jobs only (leaves postgres/redis untouched)
+ExecReload=${docker_bin} compose \\
+    -f docker-compose.yml \\
+    -f docker-compose.override.yml \\
+    restart web jobs
+
+StandardOutput=journal
+StandardError=journal
+
+# Canvas startup includes Rails boot + asset loading — allow plenty of time
+TimeoutStartSec=300
+TimeoutStopSec=90
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    _sudo systemctl daemon-reload
+    _sudo systemctl enable canvas-lms \
+        || die "Failed to enable canvas-lms.service"
+
+    log_ok "Service file: $service_path"
+    log_ok "canvas-lms.service enabled — Canvas will start automatically on every boot"
 }
 
 # =============================================================================
@@ -895,6 +1042,8 @@ apply_patches
 configure_canvas
 pull_images
 build_and_start
+configure_firewall
+create_systemd_service
 
 # =============================================================================
 # Done
@@ -910,12 +1059,18 @@ echo "  Password: ${GENERATED_ADMIN_PASS}"
 echo ""
 printf "  %sCHANGE THE PASSWORD after your first login.%s\n" "$YELLOW" "$NC"
 echo ""
-echo "  ── Useful commands ──────────────────────────────────"
+echo "  ── Managing Canvas ──────────────────────────────────"
+echo ""
+echo "  Start:   sudo systemctl start canvas-lms"
+echo "  Stop:    sudo systemctl stop  canvas-lms"
+echo "  Restart: sudo systemctl restart canvas-lms"
+echo "  Status:  sudo systemctl status canvas-lms"
+echo "  Disable auto-start: sudo systemctl disable canvas-lms"
+echo ""
+echo "  ── Logs and console ─────────────────────────────────"
 echo "  cd $CANVAS_DIR"
 echo ""
 echo "  Logs:    $DOCKER_CMD compose -f docker-compose.yml -f docker-compose.override.yml logs -f"
-echo "  Stop:    $DOCKER_CMD compose -f docker-compose.yml -f docker-compose.override.yml down"
-echo "  Start:   $DOCKER_CMD compose -f docker-compose.yml -f docker-compose.override.yml up -d"
 echo "  Console: $DOCKER_CMD compose -f docker-compose.yml -f docker-compose.override.yml exec web bundle exec rails console"
 echo ""
 printf "  %sNote:%s config/security.yml was generated with a random encryption key.\n" "$YELLOW" "$NC"

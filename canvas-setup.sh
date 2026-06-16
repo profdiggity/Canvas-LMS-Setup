@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# SPDX-FileCopyrightText: 2026 PrivacySafe Foundation Inc.
+# SPDX-FileCopyrightText: 2026 PrivacySafe Foundation, Inc.
 # SPDX-License-Identifier: MIT
 #
 # canvas-setup.sh — Canvas LMS local development installer for Ubuntu 24.04
 #
-# Part of the Canvas LMS Setup Toolkit by PrivacySafe Foundation Inc.
+# Part of the Canvas LMS Setup Toolkit by PrivacySafe Foundation, Inc.
 # MIT License — see LICENSE file or https://opensource.org/licenses/MIT
 #
 # Canvas LMS is open-source software developed by Instructure, Inc. and

@@ -2,7 +2,7 @@
 
 > Fully automated Canvas LMS local development setup for Ubuntu GNU/Linux, macOS, and Windows
 
-A self-contained setup toolkit by [PrivacySafe Foundation Inc.](https://privacysafe.foundation)
+A self-contained setup toolkit by [PrivacySafe Foundation, Inc.](https://privacysafe.foundation)
 
 ## Quick Start
 
@@ -109,7 +109,7 @@ All passwords and keys written by these scripts are **placeholders for local dev
 
 ## License
 
-Canvas LMS Setup Toolkit is copyright 2026 PrivacySafe Foundation Inc. and licensed under the **MIT License**. See [`LICENSE`](LICENSE) for the full text.
+Canvas LMS Setup Toolkit is copyright 2026 PrivacySafe Foundation, Inc. and licensed under the **MIT License**. See [`LICENSE`](LICENSE) for the full text.
 
 Canvas LMS is open-source software developed by Instructure, Inc. and licensed under the **GNU Affero General Public License v3.0** (AGPL-3.0). Source: https://github.com/instructure/canvas-lms
 

@@ -1,9 +1,9 @@
-# SPDX-FileCopyrightText: 2026 PrivacySafe Foundation Inc.
+# SPDX-FileCopyrightText: 2026 PrivacySafe Foundation, Inc.
 # SPDX-License-Identifier: MIT
 #
 # canvas-setup-windows.ps1 — Canvas LMS local development installer for Windows
 #
-# Part of the Canvas LMS Setup Toolkit by PrivacySafe Foundation Inc.
+# Part of the Canvas LMS Setup Toolkit by PrivacySafe Foundation, Inc.
 # MIT License — see LICENSE file or https://opensource.org/licenses/MIT
 #
 # Canvas LMS is open-source software developed by Instructure, Inc. and
@@ -60,7 +60,7 @@
       config/security.yml (generated encryption key) must never be committed.
 
     COPYRIGHT / LICENSE:
-      This script is copyright 2026 PrivacySafe Foundation Inc., MIT License.
+      This script is copyright 2026 PrivacySafe Foundation, Inc., MIT License.
       Canvas LMS is copyright Instructure, Inc., AGPL-3.0 License.
 #>
 
@@ -675,61 +675,40 @@ END `$`$;
         if ($LASTEXITCODE -ne 0) { Write-Fail "Failed to create canvas postgres role" }
         Write-Ok "canvas role ready"
 
-        # --- Start web and jobs -----------------------------------------------
-        Write-Step "Step 8: Starting web and jobs containers"
-        Invoke-Compose up -d web jobs
-        if ($LASTEXITCODE -ne 0) { Write-Fail "Failed to start web/jobs" }
-
-        $webWaited = 0
-        while ($webWaited -lt 120) {
-            Invoke-Compose exec -T web echo "ok" 2>&1 | Out-Null
-            if ($LASTEXITCODE -eq 0) { break }
-            Start-Sleep 4; $webWaited += 4
-            Write-Info "  ${webWaited}s..."
-        }
-        if ($webWaited -ge 120) { Write-Fail "Web container never became ready. Check: docker compose logs web" }
-        Write-Ok "Web container ready"
-
-        # --- Install bundler-multilock once in the running container ----------
-        # Canvas requires this Bundler plugin. exec reuses the same running
-        # container filesystem — the plugin installed here persists for all
-        # subsequent exec calls without reinstalling.
-        Write-Info "Installing bundler-multilock plugin..."
-        Invoke-Compose exec -T web bundle plugin install bundler-multilock 2>&1 | Out-Null
-
-        # --- Install Ruby gems and frontend assets ----------------------------
-        Write-Step "Step 9: Installing Ruby gems and frontend assets  (slow)"
-        Invoke-Compose exec -T web ./script/install_assets.sh
+        # --- Setup via run --rm (temporary containers) ------------------------
+        # We do NOT start the web container yet. All setup tasks run in
+        # temporary containers (run --rm) that are destroyed when they finish.
+        # The serving web container starts fresh via up -d with no prior state.
+        # bundler-multilock is reinstalled per-container since it lives in the
+        # container home dir and does not persist across container exits.
+        Write-Step "Step 8: Installing Ruby gems and frontend assets  (slow)"
+        Invoke-Compose run --rm --no-deps web bash -c `
+            "set -e; bundle plugin install bundler-multilock || true; ./script/install_assets.sh"
         if ($LASTEXITCODE -ne 0) { Write-Fail "install_assets.sh failed — check output above" }
         Write-Ok "Assets installed"
 
-        # --- Database setup ---------------------------------------------------
-        Write-Step "Step 10: Creating and seeding the database"
-        Invoke-Compose exec -T web bash -c "RAILS_ENV=development bundle exec rake db:create db:initial_setup"
+        Write-Step "Step 9: Creating and seeding the database"
+        Invoke-Compose run --rm --no-deps web bash -c `
+            "set -e; bundle plugin install bundler-multilock || true; RAILS_ENV=development bundle exec rake db:create db:initial_setup"
         if ($LASTEXITCODE -ne 0) { Write-Fail "Database setup failed — check output above" }
         Write-Ok "Database created and seeded"
 
-        Invoke-Compose exec -T web bash -c "RAILS_ENV=test bundle exec rake db:migrate" 2>&1 | Out-Null
-        if ($LASTEXITCODE -ne 0) {
-            Write-Warn "Test DB migration skipped (non-fatal for normal use)"
-        }
+        Invoke-Compose run --rm --no-deps web bash -c `
+            "bundle plugin install bundler-multilock || true; RAILS_ENV=test bundle exec rake db:migrate" 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) { Write-Warn "Test DB migration skipped (non-fatal)" }
 
-        # --- Restart web and jobs ---------------------------------------------
-        # Passenger starts before the DB is seeded. Restarting ensures it picks
-        # up the fully seeded database and compiled assets from the start.
-        Write-Step "Step 11: Restarting web services"
-        Invoke-Compose restart web jobs
-        if ($LASTEXITCODE -ne 0) { Write-Fail "Failed to restart web/jobs" }
-        Write-Ok "web and jobs restarted"
+        # --- Start all services -----------------------------------------------
+        # The web container starts here for the FIRST time as a serving
+        # container — no stale PID files, no old unix sockets, nothing.
+        Write-Step "Step 10: Starting all Canvas services"
+        Invoke-Compose up -d
+        if ($LASTEXITCODE -ne 0) { Write-Fail "Failed to start Canvas services" }
+        Write-Ok "All services started"
 
         # --- Wait for Passenger to signal ready -------------------------------
-        # Passenger logs "Passenger core online" the instant it has bound its
-        # socket. We stream the container logs in a background job and check
-        # each line as it arrives — no polling, responds the moment it's ready.
-        # --tail 0 ensures we only see lines from after the restart.
         Write-Step "Waiting for Passenger to come online..."
         $passengerReady = $false
-        $canvasDir = $CANVAS_DIR   # capture for use inside the job scope
+        $canvasDir = $CANVAS_DIR
 
         $logJob = Start-Job -ScriptBlock {
             Set-Location $using:canvasDir
@@ -742,24 +721,162 @@ END `$`$;
             Start-Sleep -Seconds 1
             $lines = Receive-Job $logJob -ErrorAction SilentlyContinue
             foreach ($line in ($lines -split "`n")) {
-                if ($line -match "Passenger core online") {
-                    $passengerReady = $true; break
-                }
+                if ($line -match "Passenger core online") { $passengerReady = $true; break }
             }
         }
         Stop-Job  $logJob -ErrorAction SilentlyContinue
         Remove-Job $logJob -ErrorAction SilentlyContinue
 
         if ($passengerReady) {
-            Write-Ok "Canvas is live at http://localhost:$Port"
+            Write-Ok "Passenger online"
         } else {
             Write-Warn "Passenger did not signal ready within 3 minutes."
-            Write-Warn "Canvas may still be starting — check: docker compose logs web"
-            Write-Warn "Then try: http://localhost:$Port"
+            Write-Warn "Check: docker compose logs web"
+        }
+
+        # --- Verify HTTP is actually reachable --------------------------------
+        Write-Step "Verifying HTTP connectivity on port $Port..."
+        $httpWaited = 0
+        $httpOk = $false
+        while ($httpWaited -lt 60) {
+            try {
+                Invoke-WebRequest -Uri "http://localhost:$Port" `
+                    -TimeoutSec 3 -UseBasicParsing -ErrorAction Stop | Out-Null
+                $httpOk = $true; break
+            } catch { }
+            Start-Sleep 3; $httpWaited += 3
+            Write-Info "  ${httpWaited}s..."
+        }
+        if ($httpOk) {
+            Write-Ok "Canvas is live at http://localhost:$Port"
+        } else {
+            Write-Warn "Port $Port not responding after 60s."
+            Write-Warn "Check: docker compose -f docker-compose.yml -f docker-compose.override.yml logs --tail 40 web"
         }
 
     } finally {
         Pop-Location
+    }
+}
+
+
+# =============================================================================
+# STEP A - Windows Firewall
+#
+# Docker Desktop on Windows uses WSL2, which handles port forwarding. Windows
+# Firewall may block inbound connections on the Canvas port from the network.
+# We add an explicit inbound allow rule for the web port.
+#
+# Postgres (5432) and Redis (6379) are bound to 127.0.0.1 only — never
+# exposed externally regardless of firewall settings.
+# =============================================================================
+function Set-CanvasFirewall {
+    Write-Step "Step A: Windows Firewall"
+
+    $ruleName = "Canvas LMS (port $Port)"
+
+    $existing = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
+    if ($existing) {
+        Write-Ok "Firewall: rule for port $Port already exists"
+        return
+    }
+
+    try {
+        New-NetFirewallRule `
+            -DisplayName  $ruleName `
+            -Description  "Canvas LMS local development — port $Port" `
+            -Direction    Inbound `
+            -Protocol     TCP `
+            -LocalPort    $Port `
+            -Action       Allow `
+            -Profile      Private, Domain `
+            | Out-Null
+        Write-Ok "Windows Firewall: inbound TCP $Port allowed (Private + Domain profiles)"
+        Write-Info "Postgres/Redis are bound to 127.0.0.1 — not exposed externally."
+    } catch {
+        Write-Warn "Could not create firewall rule (may need Administrator): $_"
+        Write-Warn "Run manually: New-NetFirewallRule -DisplayName '$ruleName' -Direction Inbound -Protocol TCP -LocalPort $Port -Action Allow"
+    }
+}
+
+# =============================================================================
+# STEP B - Task Scheduler auto-start task
+#
+# Windows has no systemd or launchd. We use Task Scheduler to start Canvas
+# automatically when the user logs in.
+#
+# Three-layer persistence on Windows:
+#
+#   Layer 1 - Docker Desktop starts with Windows:
+#     Docker Desktop is configured to start automatically by default.
+#     Verify: Docker Desktop -> Settings -> General -> Start Docker Desktop
+#     when you log in.
+#
+#   Layer 2 - restart: unless-stopped in docker-compose.override.yml:
+#     When Docker Desktop starts, it automatically restarts containers that
+#     were running before the last shutdown (crash recovery).
+#
+#   Layer 3 - Task Scheduler task (this step):
+#     Runs "docker compose up -d" at login as a backup and management tool.
+#     docker compose up -d is idempotent — safe to run even if containers
+#     are already running from Layer 2.
+#
+# Management:
+#   Start:   Start-ScheduledTask -TaskPath "\PrivacySafe" -TaskName "Canvas LMS"
+#   Stop:    Stop-ScheduledTask  -TaskPath "\PrivacySafe" -TaskName "Canvas LMS"
+#   Disable: Disable-ScheduledTask -TaskPath "\PrivacySafe" -TaskName "Canvas LMS"
+#   Enable:  Enable-ScheduledTask  -TaskPath "\PrivacySafe" -TaskName "Canvas LMS"
+#   Or open Task Scheduler and navigate to PrivacySafe\Canvas LMS
+# =============================================================================
+function Register-CanvasStartupTask {
+    Write-Step "Step B: Registering Canvas LMS startup task"
+
+    $taskPath = "\PrivacySafe\"
+    $taskName = "Canvas LMS"
+    $dockerBin = (Get-Command docker -ErrorAction SilentlyContinue)?.Source
+    if (-not $dockerBin) { $dockerBin = "docker" }
+
+    # Create the task folder if it doesn't exist
+    try {
+        $scheduler = New-Object -ComObject Schedule.Service
+        $scheduler.Connect()
+        $root = $scheduler.GetFolder("\")
+        try { $root.GetFolder("PrivacySafe") | Out-Null }
+        catch { $root.CreateFolder("PrivacySafe") | Out-Null }
+    } catch { Write-Warn "Could not create Task Scheduler folder (non-fatal)" }
+
+    $action = New-ScheduledTaskAction `
+        -Execute         $dockerBin `
+        -Argument        "compose -f docker-compose.yml -f docker-compose.override.yml up -d" `
+        -WorkingDirectory $CANVAS_DIR
+
+    # Trigger at logon of the current user
+    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+
+    # Retry 3 times with 1-minute gaps in case Docker Desktop hasn't started yet
+    $settings = New-ScheduledTaskSettingsSet `
+        -StartWhenAvailable `
+        -ExecutionTimeLimit (New-TimeSpan -Minutes 5) `
+        -RestartCount       3 `
+        -RestartInterval    (New-TimeSpan -Minutes 1) `
+        -MultipleInstances  IgnoreNew
+
+    try {
+        Register-ScheduledTask `
+            -TaskPath   $taskPath `
+            -TaskName   $taskName `
+            -Description "Starts Canvas LMS Docker containers at login" `
+            -Action     $action `
+            -Trigger    $trigger `
+            -Settings   $settings `
+            -RunLevel   Highest `
+            -Force      | Out-Null
+
+        Write-Ok "Task Scheduler: '\PrivacySafe\Canvas LMS' registered"
+        Write-Ok "Canvas will start automatically when you log in"
+    } catch {
+        Write-Warn "Could not register scheduled task (may need Administrator): $_"
+        Write-Warn "Canvas will still auto-start via Docker's restart:unless-stopped policy."
     }
 }
 
@@ -773,6 +890,8 @@ Update-Dockerfiles
 $creds = Set-CanvasConfig
 Get-DockerImages
 Start-Canvas
+Set-CanvasFirewall
+Register-CanvasStartupTask
 
 # =============================================================================
 # Done
@@ -788,11 +907,16 @@ Write-Host "  Password: $($creds.Password)"                       -ForegroundCol
 Write-Host ""
 Write-Host "  CHANGE THE PASSWORD after your first login."        -ForegroundColor Yellow
 Write-Host ""
-Write-Host "  Useful commands (run from $CANVAS_DIR):" -ForegroundColor White
+Write-Host "  Managing Canvas:" -ForegroundColor White
+Write-Host ""
+Write-Host "  Start:   Start-ScheduledTask  -TaskPath '\PrivacySafe' -TaskName 'Canvas LMS'"
+Write-Host "  Stop:    Stop-ScheduledTask   -TaskPath '\PrivacySafe' -TaskName 'Canvas LMS'"
+Write-Host "  Disable auto-start: Disable-ScheduledTask -TaskPath '\PrivacySafe' -TaskName 'Canvas LMS'"
+Write-Host "  Enable  auto-start: Enable-ScheduledTask  -TaskPath '\PrivacySafe' -TaskName 'Canvas LMS'"
+Write-Host ""
+Write-Host "  Logs and console (run from $CANVAS_DIR):" -ForegroundColor White
 Write-Host ""
 Write-Host "  Logs:    docker compose -f docker-compose.yml -f docker-compose.override.yml logs -f"
-Write-Host "  Stop:    docker compose -f docker-compose.yml -f docker-compose.override.yml down"
-Write-Host "  Start:   docker compose -f docker-compose.yml -f docker-compose.override.yml up -d"
 Write-Host "  Console: docker compose -f docker-compose.yml -f docker-compose.override.yml exec web bundle exec rails console"
 Write-Host ""
 Write-Host "  Note: config/security.yml was generated with a random encryption key." -ForegroundColor Yellow

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# SPDX-FileCopyrightText: 2026 PrivacySafe Foundation Inc.
+# SPDX-FileCopyrightText: 2026 PrivacySafe Foundation, Inc.
 # SPDX-License-Identifier: MIT
 #
 # canvas-setup-macos.sh — Canvas LMS local development installer for macOS
 #
-# Part of the Canvas LMS Setup Toolkit by PrivacySafe Foundation Inc.
+# Part of the Canvas LMS Setup Toolkit by PrivacySafe Foundation, Inc.
 # MIT License — see LICENSE file or https://opensource.org/licenses/MIT
 #
 # Canvas LMS is open-source software developed by Instructure, Inc. and
@@ -778,56 +778,48 @@ build_and_start() {
     " || die "Failed to create canvas postgres role"
     log_ok "canvas role ready"
 
-    # --- Start web and jobs ---------------------------------------------------
-    log_step "Step 8: Starting web and jobs"
-    $dc up -d web jobs || die "Failed to start web/jobs"
+    # --- Setup via run --rm (temporary containers) ----------------------------
+    # We do NOT start the web container yet. All setup tasks run in temporary
+    # containers (run --rm) that are destroyed when they finish. The serving
+    # web container starts fresh via up -d with no prior state — no stale PID
+    # files, no old unix sockets, no leftover nginx processes.
+    #
+    # On Apple Silicon, DOCKER_DEFAULT_PLATFORM ensures run --rm uses amd64.
+    # bundler-multilock is reinstalled at the start of each bash -c because
+    # it lives in the container home dir and does not survive container exit.
+    [[ "$ARCH" == "arm64" ]] && export DOCKER_DEFAULT_PLATFORM=linux/amd64
 
-    local web_waited=0
-    until $dc exec -T web echo "ok" &>/dev/null; do
-        sleep 4; web_waited=$(( web_waited + 4 ))
-        log_info "  ${web_waited}s..."
-        [[ $web_waited -ge 120 ]] && die "Web container never became ready. Check: $dc logs web"
-    done
-    log_ok "Web container ready"
-
-    # --- Install bundler-multilock in the running container -------------------
-    # Canvas requires this Bundler plugin. We install it once into the running
-    # container; all subsequent exec calls reuse the same container filesystem
-    # so the plugin stays available without reinstalling.
-    log_info "Installing bundler-multilock plugin..."
-    $dc exec -T web bundle plugin install bundler-multilock 2>/dev/null || true
-
-    # --- Install Ruby gems and frontend assets --------------------------------
-    log_step "Step 9: Installing Ruby gems and frontend assets  (slow)"
-    $dc exec -T --workdir /usr/src/app web ./script/install_assets.sh \
-        || die "install_assets.sh failed — check output above"
+    log_step "Step 8: Installing Ruby gems and frontend assets  (slow)"
+    $dc run --rm --no-deps web bash -c "
+        set -e
+        bundle plugin install bundler-multilock || true
+        ./script/install_assets.sh
+    " || die "install_assets.sh failed — check output above"
     log_ok "Assets installed"
 
-    # --- Database setup -------------------------------------------------------
-    log_step "Step 10: Creating and seeding the database"
-    $dc exec -T web bash -c \
-        "RAILS_ENV=development bundle exec rake db:create db:initial_setup" \
-        || die "Database setup failed — check output above"
+    log_step "Step 9: Creating and seeding the database"
+    $dc run --rm --no-deps web bash -c "
+        set -e
+        bundle plugin install bundler-multilock || true
+        RAILS_ENV=development bundle exec rake db:create db:initial_setup
+    " || die "Database setup failed — check output above"
     log_ok "Database created and seeded"
 
-    $dc exec -T web bash -c \
-        "RAILS_ENV=test bundle exec rake db:migrate" 2>/dev/null \
-        || log_warn "Test DB migration skipped (non-fatal for normal use)"
+    $dc run --rm --no-deps web bash -c "
+        bundle plugin install bundler-multilock || true
+        RAILS_ENV=test bundle exec rake db:migrate
+    " 2>/dev/null || log_warn "Test DB migration skipped (non-fatal)"
 
-    # --- Restart web and jobs -------------------------------------------------
-    # Passenger starts when the container first launches, before the database
-    # is seeded. A restart here ensures it picks up the fully seeded DB and
-    # compiled assets cleanly, so the browser actually gets a working Canvas.
-    log_step "Step 11: Restarting web services"
-    $dc restart web jobs || die "Failed to restart web/jobs"
-    log_ok "web and jobs restarted"
+    # --- Start all services ---------------------------------------------------
+    # The web container starts here for the FIRST time as a serving container.
+    # Volumes already have compiled assets and a fully seeded database.
+    log_step "Step 10: Starting all Canvas services"
+    $dc up -d || die "Failed to start Canvas services"
+    log_ok "All services started"
 
     # --- Wait for Passenger to signal ready -----------------------------------
-    # Passenger logs "Passenger core online" the instant it has bound its socket
-    # and is ready to accept connections. We stream the container logs and break
-    # the moment that line appears — no polling interval, no arbitrary sleep.
-    # --tail 0 means we only see lines produced after we start following, so
-    # we don't match stale output from before the restart.
+    # Passenger logs "Passenger core online" the instant it is bound and ready.
+    # --tail 0 ensures we only see lines from this fresh startup.
     log_step "Waiting for Passenger to come online..."
     local passenger_ready=false
     while IFS= read -r log_line; do
@@ -838,12 +830,140 @@ build_and_start() {
     done < <(timeout 180 $dc logs --follow --tail 0 web 2>&1 || true)
 
     if [[ "$passenger_ready" == true ]]; then
-        log_ok "Canvas is live at http://localhost:${PORT}"
+        log_ok "Passenger online"
     else
         log_warn "Passenger did not signal ready within 3 minutes."
-        log_warn "Canvas may still be starting up — check: $dc logs web"
-        log_warn "Then try: http://localhost:${PORT}"
+        log_warn "Check: $dc logs web"
     fi
+
+    # --- Verify HTTP is actually reachable ------------------------------------
+    log_step "Verifying HTTP connectivity on port ${PORT}..."
+    local http_waited=0
+    until curl -s --connect-timeout 3 -o /dev/null "http://localhost:${PORT}" &>/dev/null; do
+        sleep 3; http_waited=$(( http_waited + 3 ))
+        log_info "  ${http_waited}s..."
+        if [[ $http_waited -ge 60 ]]; then
+            log_warn "Port ${PORT} not responding after 60s."
+            log_warn "Check: $dc logs --tail 40 web"
+            break
+        fi
+    done
+    [[ $http_waited -lt 60 ]] && log_ok "Canvas is live at http://localhost:${PORT}"
+}
+
+
+# =============================================================================
+# STEP A — macOS Application Firewall
+#
+# macOS uses an application-based firewall, not a port-based one. Docker
+# Desktop registers itself as a trusted application, so its bound ports
+# (including Canvas's web port) are accessible without manual firewall rules.
+# No configuration is required for local access (localhost).
+#
+# If you are accessing Canvas from another device on your LAN and macOS
+# prompts "Allow incoming connections for docker?", click Allow.
+# =============================================================================
+configure_firewall() {
+    log_step "Step A: macOS Firewall"
+    log_info "macOS uses an application-based firewall."
+    log_info "Docker Desktop is already trusted — no port rules are needed."
+    log_info "Postgres/Redis are bound to 127.0.0.1 only and are not exposed."
+    log_ok "Firewall: no action required"
+}
+
+# =============================================================================
+# STEP B — launchd LaunchAgent for persistent auto-start
+#
+# macOS uses launchd instead of systemd. A LaunchAgent in
+# ~/Library/LaunchAgents/ runs when the user logs in.
+#
+# Three-layer persistence on macOS:
+#
+#   Layer 1 — Docker Desktop "Start at Login" setting:
+#     Enable in Docker Desktop → Settings → General → Start Docker Desktop
+#     when you log in. Without this, layers 2 and 3 cannot start containers.
+#
+#   Layer 2 — restart: unless-stopped in docker-compose.override.yml:
+#     When Docker Desktop starts, it automatically restarts containers that
+#     were running before the last shutdown (crash recovery).
+#
+#   Layer 3 — com.privacysafe.canvas-lms LaunchAgent (this step):
+#     A launchd agent that runs docker compose up -d after login. Provides
+#     a clean management interface and a backup start mechanism.
+#
+# Management commands:
+#   launchctl start  com.privacysafe.canvas-lms   # start now
+#   launchctl stop   com.privacysafe.canvas-lms   # stop now
+#   launchctl enable  gui/$(id -u)/com.privacysafe.canvas-lms  # enable auto-start
+#   launchctl disable gui/$(id -u)/com.privacysafe.canvas-lms  # disable auto-start
+# =============================================================================
+configure_launchd() {
+    log_step "Step B: Creating Canvas LMS LaunchAgent"
+
+    local plist_dir="$REAL_HOME/Library/LaunchAgents"
+    local plist_path="$plist_dir/com.privacysafe.canvas-lms.plist"
+    local wrapper_path="$REAL_HOME/.canvas-lms-start.sh"
+
+    mkdir -p "$plist_dir"
+
+    # Wrapper script — waits for Docker Desktop then starts Canvas
+    cat > "$wrapper_path" << EOF
+#!/bin/bash
+# canvas-lms-start.sh — LaunchAgent helper
+# Waits for Docker Desktop to be ready, then starts Canvas LMS.
+
+# Wait up to 2.5 minutes for Docker Desktop (it may take time to start at login)
+for i in \$(seq 1 30); do
+    docker info &>/dev/null && break
+    [ "\$i" -eq 30 ] && { echo "Docker Desktop did not start in time"; exit 1; }
+    sleep 5
+done
+
+cd "${CANVAS_DIR}" || exit 1
+
+# On Apple Silicon, ensure amd64 images are used (Canvas images are amd64-only)
+[[ "\$(uname -m)" == "arm64" ]] && export DOCKER_DEFAULT_PLATFORM=linux/amd64
+
+exec docker compose \\
+    -f docker-compose.yml \\
+    -f docker-compose.override.yml \\
+    up -d
+EOF
+    chmod +x "$wrapper_path"
+    log_ok "Wrapper: $wrapper_path"
+
+    # launchd plist
+    cat > "$plist_path" << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.privacysafe.canvas-lms</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>${wrapper_path}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>/tmp/canvas-lms-launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/canvas-lms-launchd-error.log</string>
+</dict>
+</plist>
+EOF
+    log_ok "Plist:   $plist_path"
+
+    # Load the agent (starts it now and registers it for future logins)
+    launchctl load "$plist_path" 2>/dev/null || true
+    log_ok "LaunchAgent loaded and enabled"
+
+    log_warn "IMPORTANT: Enable 'Start Docker Desktop when you log in' in"
+    log_warn "Docker Desktop → Settings → General, or Canvas won't auto-start."
 }
 
 # =============================================================================
@@ -856,6 +976,8 @@ apply_patches
 configure_canvas
 pull_images
 build_and_start
+configure_firewall
+configure_launchd
 
 # =============================================================================
 # Done
@@ -871,11 +993,17 @@ echo "  Password: ${GENERATED_ADMIN_PASS}"
 echo ""
 printf "  %sCHANGE THE PASSWORD after your first login.%s\n" "$YELLOW" "$NC"
 echo ""
-echo "  ── Useful commands (run from $CANVAS_DIR) ───────"
+echo "  ── Managing Canvas ──────────────────────────────────"
+echo ""
+echo "  Start:   launchctl start  com.privacysafe.canvas-lms"
+echo "  Stop:    launchctl stop   com.privacysafe.canvas-lms"
+echo "  Disable auto-start: launchctl disable gui/\$(id -u)/com.privacysafe.canvas-lms"
+echo "  Enable  auto-start: launchctl enable  gui/\$(id -u)/com.privacysafe.canvas-lms"
+echo ""
+echo "  ── Logs and console ─────────────────────────────────"
+echo "  cd $CANVAS_DIR"
 echo ""
 echo "  Logs:    docker compose -f docker-compose.yml -f docker-compose.override.yml logs -f"
-echo "  Stop:    docker compose -f docker-compose.yml -f docker-compose.override.yml down"
-echo "  Start:   docker compose -f docker-compose.yml -f docker-compose.override.yml up -d"
 echo "  Console: docker compose -f docker-compose.yml -f docker-compose.override.yml exec web bundle exec rails console"
 echo ""
 printf "  %sNote:%s config/security.yml was generated with a random encryption key.\n" "$YELLOW" "$NC"

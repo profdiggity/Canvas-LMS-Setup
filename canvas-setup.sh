@@ -833,26 +833,27 @@ build_and_start() {
     #
     # --no-deps: postgres and redis are already running; skip dependency checks.
 
-    log_step "Step 8: Installing Ruby gems and frontend assets  (slow)"
+    # All setup steps run in a single run --rm container so that gems
+    # installed by install_assets.sh (including git-sourced gems like authlogic)
+    # remain available for the rake tasks without a second bundle install.
+    # Splitting across multiple run --rm calls destroys the gem cache on exit.
+    log_step "Step 8: Installing assets and seeding database  (slow — 20-40 min)"
     $dc run --rm --no-deps web bash -c "
         set -e
+
+        echo '--- Installing bundler-multilock plugin ---'
         bundle plugin install bundler-multilock || true
+
+        echo '--- Installing Ruby gems and frontend assets ---'
         ./script/install_assets.sh
-    " || die "install_assets.sh failed"
-    log_ok "Assets installed"
 
-    log_step "Step 9: Creating and seeding the database"
-    $dc run --rm --no-deps web bash -c "
-        set -e
-        bundle plugin install bundler-multilock || true
+        echo '--- Creating and seeding the database ---'
         RAILS_ENV=development bundle exec rake db:create db:initial_setup
-    " || die "Database setup failed"
-    log_ok "Database created and seeded"
 
-    $dc run --rm --no-deps web bash -c "
-        bundle plugin install bundler-multilock || true
-        RAILS_ENV=test bundle exec rake db:migrate
-    " 2>/dev/null || log_warn "Test DB migration skipped (non-fatal)"
+        echo '--- Migrating test database ---'
+        RAILS_ENV=test bundle exec rake db:migrate || true
+    " || die "Setup failed — check output above"
+    log_ok "Assets installed and database seeded"
 
     # --- Start all services ---------------------------------------------------
     # The web container starts here for the FIRST time as a serving container.

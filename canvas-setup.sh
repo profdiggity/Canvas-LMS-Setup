@@ -430,6 +430,36 @@ detect_postgres_image() {
     log_ok "Postgres image: $POSTGIS_IMAGE"
 }
 
+
+# =============================================================================
+# STEP 2c — Detect the correct Ruby/Passenger image from Canvas's Dockerfile
+# =============================================================================
+detect_ruby_image() {
+    local dockerfile="$CANVAS_DIR/Dockerfile"
+
+    if [[ ! -f "$dockerfile" ]]; then
+        log_warn "Canvas Dockerfile not found — keeping fallback Ruby image: $RUBY_IMAGE"
+        return 0
+    fi
+
+    # Canvas Dockerfile has:  ARG RUBY=3.4
+    #                         FROM instructure/ruby-passenger:$RUBY-jammy
+    local ruby_ver
+    ruby_ver="$(grep -m1 '^ARG RUBY=' "$dockerfile" | cut -d= -f2 | tr -d '"' | tr -d "'")"
+
+    if [[ -z "$ruby_ver" ]]; then
+        log_warn "Could not read Ruby version from Canvas Dockerfile — keeping: $RUBY_IMAGE"
+        return 0
+    fi
+
+    local detected="instructure/ruby-passenger:${ruby_ver}-jammy"
+    if [[ "$detected" != "$RUBY_IMAGE" ]]; then
+        log_info "Canvas requires Ruby image: $detected (was: $RUBY_IMAGE)"
+        RUBY_IMAGE="$detected"
+    fi
+    log_ok "Ruby image: $RUBY_IMAGE"
+}
+
 # =============================================================================
 # STEP 3 — Patch Dockerfiles
 #
@@ -571,8 +601,10 @@ PYEOF
 configure_canvas() {
     log_step "Step 4: Writing Canvas config files"
 
-    # Copy Canvas's bundled example configs first — they contain correct
-    # boilerplate for all services. We then overwrite only what we need.
+    # Create config dir FIRST, then copy — previously the copy ran before the
+    # mkdir, silently failed, and left config files missing.
+    mkdir -p "$CANVAS_DIR/config"
+
     local example_dir="$CANVAS_DIR/docker-compose/config"
     if [[ -d "$example_dir" ]]; then
         log_info "Copying example configs from docker-compose/config/"
@@ -581,8 +613,6 @@ configure_canvas() {
     else
         log_warn "docker-compose/config/ not found — writing configs from scratch"
     fi
-
-    mkdir -p "$CANVAS_DIR/config"
 
     # Random 64-hex-char encryption key — unique per installation, never stored
     # in source control. PLACEHOLDER: any 20+ char string works for dev.
@@ -710,7 +740,8 @@ services:
       - "${PORT}:80"
     volumes:
       - .:/usr/src/app
-      - canvas_bundler_plugins:/home/docker/.bundle
+      - canvas_gems:/home/docker/.gem
+      - canvas_bundle:/home/docker/.bundle
     depends_on:
       - postgres
       - redis
@@ -721,7 +752,8 @@ services:
       DISABLE_SPRING: 1
     volumes:
       - .:/usr/src/app
-      - canvas_bundler_plugins:/home/docker/.bundle
+      - canvas_gems:/home/docker/.gem
+      - canvas_bundle:/home/docker/.bundle
     depends_on:
       - postgres
       - redis
@@ -735,10 +767,13 @@ services:
       - "127.0.0.1:6379:6379"
 
 volumes:
-  canvas_bundler_plugins:
-    # Persists the bundler plugin dir across run --rm setup containers
-    # and the serving web/jobs containers. Without this, bundler-multilock
-    # is lost when the setup container exits and web/jobs fail to start.
+  # canvas_gems persists GEM_HOME (/home/docker/.gem/$RUBY) across container
+  # recreations so bundle install does not need to re-run from scratch.
+  canvas_gems:
+  # canvas_bundle persists BUNDLE_APP_CONFIG (/home/docker/.bundle) including
+  # bundler plugins such as bundler-multilock.
+  canvas_bundle:
+
 EOF
     log_ok "docker-compose.override.yml"
 
@@ -763,11 +798,14 @@ pull_images() {
 
     if [[ "$USE_MIRROR" == true ]]; then
         log_info "Using Docker mirror: $DOCKER_MIRROR"
+        # Mirror: pre-pull all images including Ruby (resolved above)
         _pull_and_tag "$DOCKER_MIRROR/$RUBY_IMAGE"          "$RUBY_IMAGE"
         _pull_and_tag "$DOCKER_MIRROR/$POSTGIS_IMAGE"       "$POSTGIS_IMAGE"
         _pull_and_tag "$DOCKER_MIRROR/library/$REDIS_IMAGE" "$REDIS_IMAGE"
     else
-        _pull_and_tag "$RUBY_IMAGE"    "$RUBY_IMAGE"
+        # Non-mirror: Ruby base image is fetched by "docker compose build --pull"
+        # so we only need to pre-pull postgres and redis here.
+        log_info "Pulling postgres and redis (Ruby image fetched during build)"
         _pull_and_tag "$POSTGIS_IMAGE" "$POSTGIS_IMAGE"
         _pull_and_tag "$REDIS_IMAGE"   "$REDIS_IMAGE"
     fi
@@ -789,31 +827,39 @@ build_and_start() {
 
     log_step "Step 6: Building Docker images  (first run takes 10-30 min)"
     if [[ "$host_uid" == "0" ]]; then
-        log_info "Building as root - skipping USER_ID remapping"
-        $dc build || die "Docker build failed"
+        log_info "Building as root — skipping USER_ID remapping"
+        $dc build --pull || die "Docker build failed"
     else
         log_info "Building with USER_ID=${host_uid} (user: $REAL_USER)"
-        $dc build --build-arg USER_ID="${host_uid}" || die "Docker build failed"
+        $dc build --pull --build-arg USER_ID="${host_uid}" || die "Docker build failed"
     fi
     log_ok "Build complete"
 
-    # --- Start postgres and redis FIRST ---------------------------------------
-    log_step "Step 7: Starting infrastructure (postgres, redis)"
-    $dc up -d postgres redis || die "Failed to start postgres/redis"
-    log_ok "postgres and redis started"
+    # --- Start everything -----------------------------------------------------
+    # Canvas's docker-compose.yml defines no named volumes for gems, so gems
+    # must live in the container's own filesystem. We therefore:
+    #   1. Start all services with up -d (web container starts, Passenger fails
+    #      initially because gems aren't installed — that's expected).
+    #   2. Run ALL setup (bundle install, assets, DB) via exec in the RUNNING
+    #      container. Gems are installed into that container's filesystem.
+    #   3. Signal Passenger to reload via tmp/restart.txt — no container
+    #      restart, so the filesystem (and gems) are preserved.
+    #   4. restart:unless-stopped means Docker restarts the same container on
+    #      reboot, preserving its filesystem — gems survive indefinitely.
+    log_step "Step 7: Starting all services"
+    $dc up -d || die "Failed to start services"
+    log_ok "All services started"
 
     # --- Wait for PostgreSQL --------------------------------------------------
     log_step "Waiting for PostgreSQL..."
-    local waited=0 max_wait=120
+    local waited=0
     until $dc exec -T postgres pg_isready -U postgres &>/dev/null; do
         sleep 3; waited=$((waited + 3))
         log_info "  ${waited}s..."
-        [[ $waited -ge $max_wait ]] && die "PostgreSQL never started. Check: $dc logs postgres"
+        [[ $waited -ge 120 ]] && die "PostgreSQL never started. Check: $dc logs postgres"
     done
     log_ok "PostgreSQL accepting connections"
 
-    # Ensure the canvas role exists — Canvas's postgres init scripts are
-    # unreliable across versions so we create/update it ourselves.
     sleep 5
     log_info "Ensuring canvas database role exists..."
     $dc exec -T postgres psql -U postgres -c "
@@ -827,26 +873,22 @@ build_and_start() {
     " || die "Failed to create canvas postgres role"
     log_ok "canvas role ready"
 
-    # --- Setup via run --rm (temporary containers) ----------------------------
-    # We deliberately do NOT start the web container yet. All setup tasks run
-    # in temporary containers (run --rm) that are destroyed when they finish.
-    # The serving web container then starts fresh via up -d with no prior state:
-    # no stale PID files, no old unix sockets, no leftover nginx processes.
-    # Running setup inside an already-serving container (exec approach) leaves
-    # that state behind and causes nginx to fail when restarted.
-    #
-    # bundler-multilock is a Bundler plugin stored in the container's home dir.
-    # It does not live on the mounted volume, so it vanishes when a container
-    # exits. We reinstall it at the start of each run --rm bash -c block.
-    #
-    # --no-deps: postgres and redis are already running; skip dependency checks.
+    # --- Wait for web container to accept exec --------------------------------
+    log_step "Step 8: Waiting for web container..."
+    local web_waited=0
+    until $dc exec -T web echo "ok" &>/dev/null; do
+        sleep 3; web_waited=$((web_waited + 3))
+        log_info "  ${web_waited}s..."
+        [[ $web_waited -ge 120 ]] && die "Web container never became ready"
+    done
+    log_ok "Web container ready"
 
-    # All setup steps run in a single run --rm container so that gems
-    # installed by install_assets.sh (including git-sourced gems like authlogic)
-    # remain available for the rake tasks without a second bundle install.
-    # Splitting across multiple run --rm calls destroys the gem cache on exit.
-    log_step "Step 8: Installing assets and seeding database  (slow — 20-40 min)"
-    $dc run --rm --no-deps web bash -c "
+    # --- All setup in the running container -----------------------------------
+    # Running via exec means gems install into the running container's
+    # filesystem and stay there. No run --rm = no ephemeral container = no
+    # lost gems. Passenger's initial failure (no gems yet) is harmless.
+    log_step "Step 9: Installing assets and seeding database  (slow — 20-40 min)"
+    $dc exec -T web bash -c "
         set -e
 
         echo '--- Installing bundler-multilock plugin ---'
@@ -863,17 +905,15 @@ build_and_start() {
     " || die "Setup failed — check output above"
     log_ok "Assets installed and database seeded"
 
-    # --- Start all services ---------------------------------------------------
-    # The web container starts here for the FIRST time as a serving container.
-    # The volumes already have compiled assets and a fully seeded database.
-    # There is no prior nginx or Passenger state to interfere with startup.
-    log_step "Step 10: Starting all Canvas services"
-    $dc up -d || die "Failed to start Canvas services"
-    log_ok "All services started"
+    # --- Reload Canvas without restarting the container ----------------------
+    # touch tmp/restart.txt tells Passenger to reload the Rails app in-place.
+    # The container keeps running, the filesystem (and gems) are preserved.
+    # This is the key difference from a container restart, which would lose gems.
+    log_step "Step 10: Reloading Canvas (Passenger restart)"
+    $dc exec -T web touch tmp/restart.txt
+    log_ok "Passenger reload triggered"
 
     # --- Wait for Passenger to signal ready -----------------------------------
-    # Passenger logs "Passenger core online" the instant it has bound its socket.
-    # --tail 0 ensures we only see lines from this fresh startup, not old output.
     log_step "Waiting for Passenger to come online..."
     local passenger_ready=false
     while IFS= read -r log_line; do
@@ -886,32 +926,22 @@ build_and_start() {
     if [[ "$passenger_ready" == true ]]; then
         log_ok "Passenger online"
     else
-        log_warn "Passenger did not signal ready within 3 minutes."
-        log_warn "Check: $dc logs web"
+        log_warn "Passenger signal not seen — Canvas may still be loading"
     fi
 
-    # --- Verify HTTP is actually reachable ------------------------------------
-    # Passenger being online confirms the app layer started. This confirms
-    # nginx has bound to the port and is serving HTTP connections.
-    # curl returns 0 for any HTTP response (including 3xx/4xx/5xx) and
-    # non-zero only for network failures (refused, timeout) — which is exactly
-    # what we want: we are verifying the port is bound, not that Canvas is happy.
-    log_step "Verifying HTTP connectivity on port ${PORT}..."
+    # --- Verify HTTP ----------------------------------------------------------
+    log_step "Verifying HTTP on port ${PORT}..."
     local http_waited=0
     until curl -s --connect-timeout 3 -o /dev/null "http://localhost:${PORT}" &>/dev/null; do
         sleep 3; http_waited=$((http_waited + 3))
         log_info "  ${http_waited}s..."
-        if [[ $http_waited -ge 60 ]]; then
-            log_warn "Port ${PORT} not responding after 60s. Diagnostics:"
-            log_warn "  $dc ps"
-            log_warn "  $dc logs --tail 40 web"
+        if [[ $http_waited -ge 120 ]]; then
+            log_warn "Port ${PORT} not responding after 120s."
+            log_warn "Check: $dc logs --tail 40 web"
             break
         fi
     done
-
-    if [[ $http_waited -lt 60 ]]; then
-        log_ok "Canvas is live at http://localhost:${PORT}"
-    fi
+    [[ $http_waited -lt 120 ]] && log_ok "Canvas is live at http://localhost:${PORT}"
 }
 
 
@@ -1047,6 +1077,7 @@ EOF
 install_prerequisites
 clone_canvas
 detect_postgres_image
+detect_ruby_image
 apply_patches
 configure_canvas
 pull_images

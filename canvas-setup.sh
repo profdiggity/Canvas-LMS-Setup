@@ -823,6 +823,9 @@ EMPTYGEMFILE
         echo "--- Installing Ruby gems and frontend assets ---"
         ./script/install_assets.sh
 
+        echo "--- Verifying Bundler can parse the real Canvas Gemfile ---"
+        bundle exec ruby -e 'puts "Bundler and Canvas Gemfile OK"'
+
         echo "--- Creating and seeding the database ---"
         RAILS_ENV=development bundle exec rake db:create db:initial_setup
 

@@ -207,6 +207,7 @@ install_prerequisites() {
     local basic_missing=()
     command -v git     &>/dev/null || basic_missing+=("git")
     command -v python3 &>/dev/null || basic_missing+=("python3")
+    command -v curl    &>/dev/null || basic_missing+=("curl")
 
     if [[ ${#basic_missing[@]} -gt 0 ]]; then
         log_info "Installing: ${basic_missing[*]}"
@@ -228,8 +229,11 @@ install_prerequisites() {
         docker_ok=true
     fi
 
-    # Also try sudo docker in case it's installed but not in PATH for this user
-    if [[ "$docker_ok" == false ]] && sudo docker compose version &>/dev/null 2>&1; then
+    # Also try sudo docker in case Docker is installed but this user cannot
+    # access the socket yet. Require both compose and buildx.
+    if [[ "$docker_ok" == false ]] \
+        && sudo docker compose version &>/dev/null 2>&1 \
+        && sudo docker buildx version &>/dev/null 2>&1; then
         docker_ok=true
         DOCKER_CMD="sudo docker"
         log_info "Docker found via sudo - will use 'sudo docker' for this session"
@@ -688,14 +692,12 @@ services:
       CANVAS_LMS_ADMIN_PASSWORD: "${admin_pass}"
       CANVAS_LMS_ACCOUNT_NAME: "Canvas Local Dev"
       CANVAS_LMS_STATS_COLLECTION: opt_out
-      YARN_CACHE_FOLDER: /home/docker/.cache/yarn-canvas
     ports:
       - "${PORT}:80"
     volumes:
       - .:/usr/src/app
       - canvas_gems:/home/docker/.gem
       - canvas_bundle:/home/docker/.bundle
-      - canvas_yarn_cache:/home/docker/.cache/yarn-canvas
     depends_on:
       - postgres
       - redis
@@ -704,12 +706,10 @@ services:
     environment:
       RAILS_ENV: development
       DISABLE_SPRING: 1
-      YARN_CACHE_FOLDER: /home/docker/.cache/yarn-canvas
     volumes:
       - .:/usr/src/app
       - canvas_gems:/home/docker/.gem
       - canvas_bundle:/home/docker/.bundle
-      - canvas_yarn_cache:/home/docker/.cache/yarn-canvas
     depends_on:
       - postgres
       - redis
@@ -729,10 +729,6 @@ volumes:
   # canvas_bundle persists BUNDLE_APP_CONFIG (/home/docker/.bundle) including
   # bundler plugins such as bundler-multilock.
   canvas_bundle:
-  # canvas_yarn_cache keeps Yarn downloads in a named volume, but setup clears it
-  # before every install to avoid corrupt partial tarballs from failed runs.
-  canvas_yarn_cache:
-
 EOF
     log_ok "docker-compose.override.yml"
 
@@ -755,12 +751,20 @@ pull_images() {
         log_ok "$dst"
     }
 
+    _mirror_image() {
+        local image="$1"
+        if [[ "$image" == */* ]]; then
+            printf '%s/%s\n' "$DOCKER_MIRROR" "$image"
+        else
+            printf '%s/library/%s\n' "$DOCKER_MIRROR" "$image"
+        fi
+    }
+
     if [[ "$USE_MIRROR" == true ]]; then
         log_info "Using Docker mirror: $DOCKER_MIRROR"
-        # Mirror: pre-pull all images including Ruby (resolved above)
-        _pull_and_tag "$DOCKER_MIRROR/$RUBY_IMAGE"          "$RUBY_IMAGE"
-        _pull_and_tag "$DOCKER_MIRROR/$POSTGIS_IMAGE"       "$POSTGIS_IMAGE"
-        _pull_and_tag "$DOCKER_MIRROR/library/$REDIS_IMAGE" "$REDIS_IMAGE"
+        _pull_and_tag "$(_mirror_image "$RUBY_IMAGE")"    "$RUBY_IMAGE"
+        _pull_and_tag "$(_mirror_image "$POSTGIS_IMAGE")" "$POSTGIS_IMAGE"
+        _pull_and_tag "$(_mirror_image "$REDIS_IMAGE")"   "$REDIS_IMAGE"
     else
         # Non-mirror: Ruby base image is fetched by "docker compose build --pull"
         # so we only need to pre-pull postgres and redis here.
@@ -769,7 +773,6 @@ pull_images() {
         _pull_and_tag "$REDIS_IMAGE"   "$REDIS_IMAGE"
     fi
 }
-
 # =============================================================================
 # STEP 6 - Build images, start services, install assets, seed database
 #
@@ -831,32 +834,31 @@ build_and_start() {
     log_ok "canvas role ready"
 
     # --- Setup via run --rm ---------------------------------------------------
-    # Use a disposable web container for setup, with named volumes for gems,
-    # Bundler config, and Yarn downloads. This follows Canvas's documented
-    # run --rm setup pattern while keeping installed gems/plugins available to
-    # the serving web/jobs containers that start afterward.
+    # Use a disposable web container for setup, with named volumes for gems
+    # and Bundler config. Yarn uses a fresh temporary cache each run so a
+    # failed install cannot poison the next attempt.
     log_step "Step 9: Installing assets and seeding database  (slow - 20-40 min)"
-    $dc run --rm --no-deps web bash -lc "
+    $dc run --rm --no-deps web bash -lc '
         set -e
 
-        echo '--- Cleaning Yarn cache from any failed previous run ---'
-        rm -rf /home/docker/.cache/yarn /home/docker/.cache/yarn-canvas /tmp/yarn-* || true
-        mkdir -p /home/docker/.cache/yarn-canvas
-        export YARN_CACHE_FOLDER=/home/docker/.cache/yarn-canvas
+        echo "--- Cleaning Yarn cache from any failed previous run ---"
+        rm -rf /home/docker/.cache/yarn /home/docker/.cache/yarn-canvas /tmp/yarn-cache-* /tmp/yarn-* || true
+        export YARN_CACHE_FOLDER="/tmp/yarn-cache-$$"
+        mkdir -p "$YARN_CACHE_FOLDER"
         yarn cache clean --all 2>/dev/null || yarn cache clean 2>/dev/null || true
 
-        echo '--- Installing bundler-multilock plugin ---'
+        echo "--- Installing bundler-multilock plugin ---"
         bundle plugin install bundler-multilock || true
 
-        echo '--- Installing Ruby gems and frontend assets ---'
+        echo "--- Installing Ruby gems and frontend assets ---"
         ./script/install_assets.sh
 
-        echo '--- Creating and seeding the database ---'
+        echo "--- Creating and seeding the database ---"
         RAILS_ENV=development bundle exec rake db:create db:initial_setup
 
-        echo '--- Migrating test database ---'
+        echo "--- Migrating test database ---"
         RAILS_ENV=test bundle exec rake db:migrate || true
-    " || die "Setup failed - check output above"
+    ' || die "Setup failed - check output above"
     log_ok "Assets installed and database seeded"
 
     # --- Start all services ---------------------------------------------------

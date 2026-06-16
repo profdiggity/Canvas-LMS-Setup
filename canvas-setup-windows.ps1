@@ -681,21 +681,23 @@ END `$`$;
         # The serving web container starts fresh via up -d with no prior state.
         # bundler-multilock is reinstalled per-container since it lives in the
         # container home dir and does not persist across container exits.
-        Write-Step "Step 8: Installing Ruby gems and frontend assets  (slow)"
-        Invoke-Compose run --rm --no-deps web bash -c `
-            "set -e; bundle plugin install bundler-multilock || true; ./script/install_assets.sh"
-        if ($LASTEXITCODE -ne 0) { Write-Fail "install_assets.sh failed — check output above" }
-        Write-Ok "Assets installed"
-
-        Write-Step "Step 9: Creating and seeding the database"
-        Invoke-Compose run --rm --no-deps web bash -c `
-            "set -e; bundle plugin install bundler-multilock || true; RAILS_ENV=development bundle exec rake db:create db:initial_setup"
-        if ($LASTEXITCODE -ne 0) { Write-Fail "Database setup failed — check output above" }
-        Write-Ok "Database created and seeded"
-
-        Invoke-Compose run --rm --no-deps web bash -c `
-            "bundle plugin install bundler-multilock || true; RAILS_ENV=test bundle exec rake db:migrate" 2>&1 | Out-Null
-        if ($LASTEXITCODE -ne 0) { Write-Warn "Test DB migration skipped (non-fatal)" }
+        # All setup steps in one container — gems from install_assets.sh
+        # (including git-sourced gems like authlogic) remain available for
+        # rake tasks. Separate run --rm calls destroy the gem cache on exit.
+        Write-Step "Step 8: Installing assets and seeding database  (slow — 15-30 min)"
+        Invoke-Compose run --rm --no-deps web bash -c (
+            "set -e; " +
+            "echo '--- Installing bundler-multilock plugin ---'; " +
+            "bundle plugin install bundler-multilock || true; " +
+            "echo '--- Installing Ruby gems and frontend assets ---'; " +
+            "./script/install_assets.sh; " +
+            "echo '--- Creating and seeding the database ---'; " +
+            "RAILS_ENV=development bundle exec rake db:create db:initial_setup; " +
+            "echo '--- Migrating test database ---'; " +
+            "RAILS_ENV=test bundle exec rake db:migrate || true"
+        )
+        if ($LASTEXITCODE -ne 0) { Write-Fail "Setup failed — check output above" }
+        Write-Ok "Assets installed and database seeded"
 
         # --- Start all services -----------------------------------------------
         # The web container starts here for the FIRST time as a serving

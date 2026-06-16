@@ -968,6 +968,122 @@ EOF
     log_ok "canvas-lms.service enabled — Canvas will start automatically on every boot"
 }
 
+
+# =============================================================================
+# STEP C — Boot splash screen on tty1
+#
+# Displays a Canvas LMS welcome screen on the virtual console after every boot,
+# once Canvas is confirmed reachable over HTTP. Styled after common appliance
+# VMs (SuiteCRM, Bitnami, etc.) so the user immediately sees the URL and
+# login credentials without needing to dig through logs.
+# =============================================================================
+create_splash_service() {
+    log_step "Step C: Installing boot splash screen"
+
+    local splash_script="/usr/local/bin/canvas-lms-splash"
+    local splash_service="/etc/systemd/system/canvas-lms-splash.service"
+
+    # --- The splash script ----------------------------------------------------
+    _sudo tee "$splash_script" > /dev/null << SPLASHEOF
+#!/usr/bin/env bash
+# canvas-lms-splash — displayed on tty1 after Canvas is reachable
+PORT="${PORT}"
+CANVAS_DIR="${CANVAS_DIR}"
+
+# Wait until Canvas responds over HTTP (up to 5 minutes)
+waited=0
+while ! curl -s --connect-timeout 3 -o /dev/null "http://localhost:\$PORT" 2>/dev/null; do
+    sleep 5; waited=\$((waited + 5))
+    [[ \$waited -ge 300 ]] && break
+done
+
+# Detect real LAN IP (skip loopback and Docker bridges)
+HOST_IP="\$(ip -4 addr show scope global \
+    | grep -v 'docker\|br-\|veth' \
+    | grep -oP '(?<=inet\s)\d+(\.\d+){3}' \
+    | head -1)"
+HOST_IP="\${HOST_IP:-localhost}"
+
+STATUS="running"
+curl -s --connect-timeout 3 -o /dev/null "http://localhost:\$PORT" 2>/dev/null \
+    || STATUS="not yet reachable — check: sudo systemctl status canvas-lms"
+
+clear
+cat << BANNER
+
+
+  *******************************************************************
+  *                                                                 *
+  *               C A N V A S   L M S                              *
+  *          Local Development Appliance                            *
+  *                                                                 *
+  *******************************************************************
+
+  Canvas is \$STATUS.
+
+  Access Canvas LMS from any browser on your network:
+
+    http://localhost:\${PORT}          (this machine)
+    http://\${HOST_IP}:\${PORT}   (network / other devices)
+
+  Default login credentials:
+    Email:    admin@canvas.local
+    Password: ChangeMe_AfterSetup_1!
+
+  *** CHANGE THE PASSWORD after your first login. ***
+
+  -------------------------------------------------------------------
+  If this VM was downloaded from osboxes.org:
+    Username: osboxes
+    Password: osboxes.org
+
+  To open a browser here, run:   firefox http://localhost:\${PORT} &
+  -------------------------------------------------------------------
+
+  Manage Canvas:
+    sudo systemctl start   canvas-lms
+    sudo systemctl stop    canvas-lms
+    sudo systemctl restart canvas-lms
+    sudo systemctl status  canvas-lms
+
+  View logs:
+    docker compose -f \$CANVAS_DIR/docker-compose.yml \\
+        -f \$CANVAS_DIR/docker-compose.override.yml logs -f
+
+  *******************************************************************
+
+BANNER
+SPLASHEOF
+    _sudo chmod +x "$splash_script"
+    log_ok "Splash script: $splash_script"
+
+    # --- The systemd unit -----------------------------------------------------
+    _sudo tee "$splash_service" > /dev/null << SVCEOF
+[Unit]
+Description=Canvas LMS Boot Splash Screen
+After=canvas-lms.service network-online.target
+Requires=canvas-lms.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$splash_script
+StandardOutput=tty
+StandardInput=tty
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=no
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+
+    _sudo systemctl daemon-reload
+    _sudo systemctl enable canvas-lms-splash
+    log_ok "canvas-lms-splash.service enabled — will display on tty1 after each boot"
+}
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -980,6 +1096,7 @@ pull_images
 build_and_start
 configure_firewall
 create_systemd_service
+create_splash_service
 
 # =============================================================================
 # Done

@@ -698,6 +698,7 @@ services:
       - .:/usr/src/app
       - canvas_gems:/home/docker/.gem
       - canvas_bundle:/home/docker/.bundle
+      - canvas_cache:/home/docker/.cache
     depends_on:
       - postgres
       - redis
@@ -710,6 +711,7 @@ services:
       - .:/usr/src/app
       - canvas_gems:/home/docker/.gem
       - canvas_bundle:/home/docker/.bundle
+      - canvas_cache:/home/docker/.cache
     depends_on:
       - postgres
       - redis
@@ -729,6 +731,9 @@ volumes:
   # canvas_bundle persists BUNDLE_APP_CONFIG (/home/docker/.bundle) including
   # bundler plugins such as bundler-multilock.
   canvas_bundle:
+  # canvas_cache gives Yarn a writable cache directory. The setup step clears
+  # Yarn package extracts each run so failed installs cannot poison retries.
+  canvas_cache:
 EOF
     log_ok "docker-compose.override.yml"
 
@@ -834,17 +839,27 @@ build_and_start() {
     log_ok "canvas role ready"
 
     # --- Setup via run --rm ---------------------------------------------------
-    # Use a disposable web container for setup, with named volumes for gems
-    # and Bundler config. Yarn uses a fresh temporary cache each run so a
-    # failed install cannot poison the next attempt.
+    # Use disposable web containers for setup. First repair ownership as root,
+    # then run the Canvas setup commands as the normal docker user. Canvas's
+    # install_assets.sh uses /home/docker/.cache/yarn-canvas, so the cache path
+    # must exist and be writable before yarn install starts.
     log_step "Step 9: Installing assets and seeding database  (slow - 20-40 min)"
+
+    $dc run --rm --no-deps --user root web bash -lc '
+        set -e
+        echo "--- Preparing writable cache and bundle directories ---"
+        mkdir -p /home/docker/.cache/yarn-canvas /home/docker/.gem /home/docker/.bundle
+        rm -rf /home/docker/.cache/yarn-canvas/v6
+        rm -rf /home/docker/.cache/yarn /home/docker/.cache/yarn-v6
+        rm -rf /tmp/yarn-cache-* /tmp/yarn-*
+        chown -R docker:docker /home/docker/.cache /home/docker/.gem /home/docker/.bundle
+    ' || die "Failed to prepare writable Docker volumes"
+
     $dc run --rm --no-deps web bash -lc '
         set -e
+        export HOME=/home/docker
 
         echo "--- Cleaning Yarn cache from any failed previous run ---"
-        rm -rf /home/docker/.cache/yarn /home/docker/.cache/yarn-canvas /tmp/yarn-cache-* /tmp/yarn-* || true
-        export YARN_CACHE_FOLDER="/tmp/yarn-cache-$$"
-        mkdir -p "$YARN_CACHE_FOLDER"
         yarn cache clean --all 2>/dev/null || yarn cache clean 2>/dev/null || true
 
         echo "--- Installing bundler-multilock plugin ---"

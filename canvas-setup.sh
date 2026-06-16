@@ -688,12 +688,14 @@ services:
       CANVAS_LMS_ADMIN_PASSWORD: "${admin_pass}"
       CANVAS_LMS_ACCOUNT_NAME: "Canvas Local Dev"
       CANVAS_LMS_STATS_COLLECTION: opt_out
+      YARN_CACHE_FOLDER: /home/docker/.cache/yarn-canvas
     ports:
       - "${PORT}:80"
     volumes:
       - .:/usr/src/app
       - canvas_gems:/home/docker/.gem
       - canvas_bundle:/home/docker/.bundle
+      - canvas_yarn_cache:/home/docker/.cache/yarn-canvas
     depends_on:
       - postgres
       - redis
@@ -702,10 +704,12 @@ services:
     environment:
       RAILS_ENV: development
       DISABLE_SPRING: 1
+      YARN_CACHE_FOLDER: /home/docker/.cache/yarn-canvas
     volumes:
       - .:/usr/src/app
       - canvas_gems:/home/docker/.gem
       - canvas_bundle:/home/docker/.bundle
+      - canvas_yarn_cache:/home/docker/.cache/yarn-canvas
     depends_on:
       - postgres
       - redis
@@ -725,6 +729,9 @@ volumes:
   # canvas_bundle persists BUNDLE_APP_CONFIG (/home/docker/.bundle) including
   # bundler plugins such as bundler-multilock.
   canvas_bundle:
+  # canvas_yarn_cache keeps Yarn downloads in a named volume, but setup clears it
+  # before every install to avoid corrupt partial tarballs from failed runs.
+  canvas_yarn_cache:
 
 EOF
     log_ok "docker-compose.override.yml"
@@ -787,20 +794,18 @@ build_and_start() {
     fi
     log_ok "Build complete"
 
-    # --- Start everything -----------------------------------------------------
-    # Canvas's docker-compose.yml defines no named volumes for gems, so gems
-    # must live in the container's own filesystem. We therefore:
-    #   1. Start all services with up -d (web container starts, Passenger fails
-    #      initially because gems aren't installed - that's expected).
-    #   2. Run ALL setup (bundle install, assets, DB) via exec in the RUNNING
-    #      container. Gems are installed into that container's filesystem.
-    #   3. Signal Passenger to reload via tmp/restart.txt - no container
-    #      restart, so the filesystem (and gems) are preserved.
-    #   4. restart:unless-stopped means Docker restarts the same container on
-    #      reboot, preserving its filesystem - gems survive indefinitely.
-    log_step "Step 7: Starting all services"
-    $dc up -d || die "Failed to start services"
-    log_ok "All services started"
+    # Remove any half-started web/jobs containers from a failed previous run.
+    # This keeps setup out of the serving containers and avoids stale Yarn cache
+    # or partial filesystem state left inside an old web container.
+    log_step "Step 7: Resetting app containers from any previous failed run"
+    $dc stop web jobs &>/dev/null || true
+    $dc rm -f web jobs &>/dev/null || true
+    log_ok "web/jobs reset"
+
+    # --- Start postgres and redis first ---------------------------------------
+    log_step "Step 8: Starting infrastructure (postgres, redis)"
+    $dc up -d postgres redis || die "Failed to start postgres/redis"
+    log_ok "postgres and redis started"
 
     # --- Wait for PostgreSQL --------------------------------------------------
     log_step "Waiting for PostgreSQL..."
@@ -825,23 +830,20 @@ build_and_start() {
     " || die "Failed to create canvas postgres role"
     log_ok "canvas role ready"
 
-    # --- Wait for web container to accept exec --------------------------------
-    log_step "Step 8: Waiting for web container..."
-    local web_waited=0
-    until $dc exec -T web echo "ok" &>/dev/null; do
-        sleep 3; web_waited=$((web_waited + 3))
-        log_info "  ${web_waited}s..."
-        [[ $web_waited -ge 120 ]] && die "Web container never became ready"
-    done
-    log_ok "Web container ready"
-
-    # --- All setup in the running container -----------------------------------
-    # Running via exec means gems install into the running container's
-    # filesystem and stay there. No run --rm = no ephemeral container = no
-    # lost gems. Passenger's initial failure (no gems yet) is harmless.
+    # --- Setup via run --rm ---------------------------------------------------
+    # Use a disposable web container for setup, with named volumes for gems,
+    # Bundler config, and Yarn downloads. This follows Canvas's documented
+    # run --rm setup pattern while keeping installed gems/plugins available to
+    # the serving web/jobs containers that start afterward.
     log_step "Step 9: Installing assets and seeding database  (slow - 20-40 min)"
-    $dc exec -T web bash -c "
+    $dc run --rm --no-deps web bash -lc "
         set -e
+
+        echo '--- Cleaning Yarn cache from any failed previous run ---'
+        rm -rf /home/docker/.cache/yarn /home/docker/.cache/yarn-canvas /tmp/yarn-* || true
+        mkdir -p /home/docker/.cache/yarn-canvas
+        export YARN_CACHE_FOLDER=/home/docker/.cache/yarn-canvas
+        yarn cache clean --all 2>/dev/null || yarn cache clean 2>/dev/null || true
 
         echo '--- Installing bundler-multilock plugin ---'
         bundle plugin install bundler-multilock || true
@@ -857,13 +859,10 @@ build_and_start() {
     " || die "Setup failed - check output above"
     log_ok "Assets installed and database seeded"
 
-    # --- Reload Canvas without restarting the container ----------------------
-    # touch tmp/restart.txt tells Passenger to reload the Rails app in-place.
-    # The container keeps running, the filesystem (and gems) are preserved.
-    # This is the key difference from a container restart, which would lose gems.
-    log_step "Step 10: Reloading Canvas (Passenger restart)"
-    $dc exec -T web touch tmp/restart.txt
-    log_ok "Passenger reload triggered"
+    # --- Start all services ---------------------------------------------------
+    log_step "Step 10: Starting Canvas services"
+    $dc up -d || die "Failed to start Canvas services"
+    log_ok "Canvas services started"
 
     # --- Wait for Passenger to signal ready -----------------------------------
     log_step "Waiting for Passenger to come online..."

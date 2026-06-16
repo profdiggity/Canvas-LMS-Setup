@@ -710,6 +710,7 @@ services:
       - "${PORT}:80"
     volumes:
       - .:/usr/src/app
+      - canvas_bundler_plugins:/home/docker/.bundle
     depends_on:
       - postgres
       - redis
@@ -720,6 +721,7 @@ services:
       DISABLE_SPRING: 1
     volumes:
       - .:/usr/src/app
+      - canvas_bundler_plugins:/home/docker/.bundle
     depends_on:
       - postgres
       - redis
@@ -731,6 +733,12 @@ services:
     restart: unless-stopped
     ports:
       - "127.0.0.1:6379:6379"
+
+volumes:
+  canvas_bundler_plugins:
+    # Persists the bundler plugin dir across run --rm setup containers
+    # and the serving web/jobs containers. Without this, bundler-multilock
+    # is lost when the setup container exits and web/jobs fail to start.
 EOF
     log_ok "docker-compose.override.yml"
 

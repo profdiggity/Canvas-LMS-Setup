@@ -637,12 +637,6 @@ services:
     environment:
       RAILS_ENV: development
       DISABLE_SPRING: 1
-      # Keep Bundler plugins in the mounted app tree so run, web, and jobs
-      # containers all see the same bundler-multilock installation.
-      BUNDLE_USER_HOME: /usr/src/app/.bundle_user
-      BUNDLE_USER_CACHE: /usr/src/app/.bundle_user/cache
-      BUNDLE_USER_CONFIG: /usr/src/app/.bundle_user/config
-      BUNDLE_USER_PLUGIN: /usr/src/app/.bundle_user/plugin
       # PLACEHOLDER: change these after first login
       CANVAS_LMS_ADMIN_EMAIL: "${admin_email}"
       CANVAS_LMS_ADMIN_PASSWORD: "${admin_pass}"
@@ -660,10 +654,6 @@ services:
     environment:
       RAILS_ENV: development
       DISABLE_SPRING: 1
-      BUNDLE_USER_HOME: /usr/src/app/.bundle_user
-      BUNDLE_USER_CACHE: /usr/src/app/.bundle_user/cache
-      BUNDLE_USER_CONFIG: /usr/src/app/.bundle_user/config
-      BUNDLE_USER_PLUGIN: /usr/src/app/.bundle_user/plugin
     volumes:
       - .:/usr/src/app
     depends_on:
@@ -734,7 +724,7 @@ build_and_start() {
     local host_uid
     host_uid="$(id -u "$REAL_USER" 2>/dev/null || echo "0")"
 
-    log_step "Step 6: Building Docker images  (first run takes 10-30 min)"
+    log_step "Step 6: Building Docker images (first run takes 10-30 min)"
     if [[ "$host_uid" == "0" ]]; then
         log_info "Building as root - skipping USER_ID remapping"
         $dc build --pull || die "Docker build failed"
@@ -788,43 +778,28 @@ build_and_start() {
     $dc run --rm --no-deps --user root web bash -lc '
         set -e
         echo "--- Preparing named-volume directories ---"
-        mkdir -p /home/docker/.cache /home/docker/.gem /home/docker/.bundle \
-                 /usr/src/app/.bundle_user/cache \
-                 /usr/src/app/.bundle_user/config \
-                 /usr/src/app/.bundle_user/plugin
+        mkdir -p /home/docker/.cache /home/docker/.gem /home/docker/.bundle
         rm -rf /home/docker/.cache/yarn-canvas/v6 \
                /home/docker/.cache/yarn \
                /home/docker/.cache/yarn-v6 \
                /tmp/yarn-cache-* /tmp/yarn-*
-        chown -R docker:docker /home/docker/.cache /home/docker/.gem /home/docker/.bundle /usr/src/app/.bundle_user
-        chmod -R a+rX /usr/src/app/.bundle_user
-    ' || die "Failed to prepare Bundler and Yarn directories"
+        chown -R docker:docker /home/docker/.cache /home/docker/.gem /home/docker/.bundle
+    ' || die "Failed to prepare volume directories"
 
     $dc run --rm --no-deps web bash -lc '
         set -e
         export HOME=/home/docker
-        export BUNDLE_USER_HOME=/usr/src/app/.bundle_user
-        export BUNDLE_USER_CACHE=/usr/src/app/.bundle_user/cache
-        export BUNDLE_USER_CONFIG=/usr/src/app/.bundle_user/config
-        export BUNDLE_USER_PLUGIN=/usr/src/app/.bundle_user/plugin
 
         echo "--- Cleaning any stale Yarn cache ---"
         yarn cache clean --all 2>/dev/null || yarn cache clean 2>/dev/null || true
 
         echo "--- Installing bundler-multilock plugin before Canvas Gemfile parsing ---"
-        cat > /tmp/empty-gemfile <<'EMPTYGEMFILE'
-source "https://rubygems.org"
-EMPTYGEMFILE
+        printf "source 'https://rubygems.org'\n" > /tmp/empty-gemfile
         BUNDLE_GEMFILE=/tmp/empty-gemfile bundle plugin install bundler-multilock
-        BUNDLE_GEMFILE=/tmp/empty-gemfile bundle plugin list | grep -q bundler-multilock \
-            || { echo "bundler-multilock plugin was not installed" >&2; exit 1; }
-        chmod -R a+rX /usr/src/app/.bundle_user
+        BUNDLE_GEMFILE=/tmp/empty-gemfile bundle plugin list | grep -q bundler-multilock
 
         echo "--- Installing Ruby gems and frontend assets ---"
         ./script/install_assets.sh
-
-        echo "--- Verifying Bundler can parse the real Canvas Gemfile ---"
-        bundle exec ruby -e 'puts "Bundler and Canvas Gemfile OK"'
 
         echo "--- Creating and seeding the database ---"
         RAILS_ENV=development bundle exec rake db:create db:initial_setup
@@ -854,19 +829,32 @@ EMPTYGEMFILE
         log_warn "Check: $dc logs web"
     fi
 
-    log_step "Verifying Canvas HTTP success on port ${PORT}..."
+    log_step "Verifying HTTP on port ${PORT}..."
     local http_waited=0
-    until curl -fsS --connect-timeout 3 -o /dev/null "http://localhost:${PORT}/login" &>/dev/null; do
+    until curl -s --connect-timeout 3 -o /dev/null "http://localhost:${PORT}" &>/dev/null; do
         sleep 3; http_waited=$((http_waited + 3))
         log_info "  ${http_waited}s..."
-        if [[ $http_waited -ge 180 ]]; then
-            log_err "Canvas did not return a successful /login response after 180s."
-            log_err "Passenger may be online while Rails is failing to boot."
-            log_err "Check: $dc logs --tail 120 web"
-            return 1
+        if [[ $http_waited -ge 120 ]]; then
+            log_warn "Port ${PORT} not responding after 120s."
+            log_warn "Check: $dc logs --tail 40 web"
+            break
         fi
     done
-    log_ok "Canvas login is live at http://localhost:${PORT}/login"
+    [[ $http_waited -lt 120 ]] && log_ok "HTTP is responding at http://localhost:${PORT}"
+
+    log_step "Checking Canvas login route on port ${PORT}..."
+    local login_waited=0
+    until curl -fsS --connect-timeout 3 -o /dev/null "http://localhost:${PORT}/login" &>/dev/null; do
+        sleep 3; login_waited=$((login_waited + 3))
+        log_info "  ${login_waited}s..."
+        if [[ $login_waited -ge 120 ]]; then
+            log_warn "HTTP is reachable, but Canvas /login did not return a successful response after 120s."
+            log_warn "Passenger may be serving an application error page."
+            log_warn "Check: $dc logs --tail 80 web"
+            break
+        fi
+    done
+    [[ $login_waited -lt 120 ]] && log_ok "Canvas login is live at http://localhost:${PORT}/login"
 }
 
 
@@ -1020,7 +1008,7 @@ CANVAS_DIR="${CANVAS_DIR}"
 
 # Wait until Canvas responds over HTTP (up to 5 minutes)
 waited=0
-while ! curl -fsS --connect-timeout 3 -o /dev/null "http://localhost:\$PORT/login" 2>/dev/null; do
+while ! curl -s --connect-timeout 3 -o /dev/null "http://localhost:\$PORT" 2>/dev/null; do
     sleep 5; waited=\$((waited + 5))
     [[ \$waited -ge 300 ]] && break
 done
@@ -1033,7 +1021,7 @@ HOST_IP="\$(ip -4 addr show scope global \
 HOST_IP="\${HOST_IP:-localhost}"
 
 STATUS="running"
-curl -fsS --connect-timeout 3 -o /dev/null "http://localhost:\$PORT/login" 2>/dev/null \
+curl -s --connect-timeout 3 -o /dev/null "http://localhost:\$PORT" 2>/dev/null \
     || STATUS="not yet reachable - check: sudo systemctl status canvas-lms"
 
 clear

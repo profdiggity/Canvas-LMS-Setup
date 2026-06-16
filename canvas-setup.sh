@@ -1,0 +1,923 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 PrivacySafe Foundation Inc.
+# SPDX-License-Identifier: MIT
+#
+# canvas-setup.sh — Canvas LMS local development installer for Ubuntu 24.04
+#
+# Part of the Canvas LMS Setup Toolkit by PrivacySafe Foundation Inc.
+# MIT License — see LICENSE file or https://opensource.org/licenses/MIT
+#
+# Canvas LMS is open-source software developed by Instructure, Inc. and
+# licensed under the GNU Affero General Public License v3.0 (AGPL-3.0).
+# Source: https://github.com/instructure/canvas-lms
+#
+# Inspired by original work by swzhang
+# https://github.com/swzhangf/Canvas-LMS-Setup
+#
+# =============================================================================
+# Usage:
+#   chmod +x canvas-setup.sh
+#   ./canvas-setup.sh --install-path ~/canvas-lms
+#   sudo ./canvas-setup.sh --install-path /opt/canvas-lms
+#   ./canvas-setup.sh --install-path /opt/canvas-lms --port 8080
+#   ./canvas-setup.sh --install-path ~/canvas-lms --mirror   # restricted networks
+#
+# What this script does:
+#   1. Installs Docker CE, Git, and Python 3 if missing
+#   2. Clones Canvas LMS from GitHub (or a Gitee mirror)
+#   3. Patches Dockerfiles for Ubuntu 24.04 / EOL-Debian compatibility
+#   4. Writes all required Canvas config files
+#   5. Builds and starts the Docker services
+#   6. Installs Ruby/JS assets inside the container
+#   7. Creates and seeds the database
+#
+# SECURITY NOTE FOR CONTRIBUTORS:
+#   Passwords and keys in this script are PLACEHOLDERS generated at runtime.
+#   Do not commit real credentials. The generated security.yml is listed in
+#   Canvas's .gitignore and will not be checked in.
+#
+# Requirements: Ubuntu 24.04, sudo access (or root), 8 GB+ RAM, 20 GB+ disk
+# =============================================================================
+
+set -euo pipefail
+
+# -----------------------------------------------------------------------------
+# Configuration — edit these defaults or override via flags
+# -----------------------------------------------------------------------------
+INSTALL_PATH=""
+USE_MIRROR=false
+PORT=3000
+
+CANVAS_REPO="https://github.com/instructure/canvas-lms.git"
+CANVAS_MIRROR="https://gitee.com/xiong-yuhui/canvas-Lms.git"
+DOCKER_MIRROR="docker.1ms.run"
+
+# Canvas base images (pinned to what Canvas's Dockerfile expects)
+RUBY_IMAGE="instructure/ruby-passenger:2.7"
+# Detected dynamically after clone — see detect_postgres_image()
+POSTGIS_IMAGE="postgis/postgis:12-2.5"  # fallback only
+REDIS_IMAGE="redis:alpine"
+
+# Populated later — the real user even when run with sudo
+REAL_USER=""
+REAL_HOME=""
+
+# Docker command — may become "sudo docker" if user isn't in the docker group
+DOCKER_CMD="docker"
+
+# -----------------------------------------------------------------------------
+# Colors / logging
+# -----------------------------------------------------------------------------
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+GRAY='\033[0;37m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+log_step() { printf "\n%s==> %s%s\n" "${CYAN}${BOLD}" "$1" "$NC"; }
+log_ok()   { printf "  %s[OK]%s   %s\n" "$GREEN"  "$NC" "$1"; }
+log_warn() { printf "  %s[WARN]%s %s\n" "$YELLOW" "$NC" "$1"; }
+log_err()  { printf "\n  %s[ERROR]%s %s\n" "$RED"  "$NC" "$1" >&2; }
+log_info() { printf "  %s-->%s   %s\n"   "$GRAY"   "$NC" "$1"; }
+
+die() { log_err "$1"; exit 1; }
+
+# Wrapper: runs apt/system commands with sudo only when we're not already root
+_sudo() { if [[ "$EUID" -eq 0 ]]; then "$@"; else sudo "$@"; fi; }
+
+# -----------------------------------------------------------------------------
+# Resolve the real (non-root) user even when invoked with sudo.
+# We need this for: docker group membership, HOME path, chown.
+# -----------------------------------------------------------------------------
+resolve_real_user() {
+    if [[ "$EUID" -eq 0 && -n "${SUDO_USER:-}" ]]; then
+        REAL_USER="$SUDO_USER"
+        REAL_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+    elif [[ "$EUID" -eq 0 ]]; then
+        # Genuinely running as root (not via sudo) — use root's home
+        REAL_USER="root"
+        REAL_HOME="/root"
+        log_warn "Running as root directly. Files in $INSTALL_PATH will be owned by root."
+        log_warn "This is fine for local testing but not recommended for shared machines."
+    else
+        REAL_USER="$USER"
+        REAL_HOME="$HOME"
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Argument parsing
+# -----------------------------------------------------------------------------
+usage() {
+    cat <<EOF
+
+${BOLD}Usage:${NC} $0 --install-path <path> [options]
+
+${BOLD}Options:${NC}
+  --install-path PATH   Full path where Canvas LMS will be cloned. Required.
+                        e.g. /opt/canvas-lms or ~/canvas-lms
+  --port PORT           Host port for Canvas (default: 3000).
+  --mirror              Use Gitee + Docker mirror (for restricted networks).
+  --help                Show this message.
+
+${BOLD}Examples:${NC}
+  $0 --install-path ~/canvas-lms
+  sudo $0 --install-path /opt/canvas-lms --port 8080
+
+EOF
+    exit 1
+}
+
+[[ $# -eq 0 ]] && usage
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --install-path)
+            [[ -z "${2:-}" ]] && die "Missing value for --install-path"
+            INSTALL_PATH="$2"; shift 2 ;;
+        --port)
+            [[ -z "${2:-}" ]] && die "Missing value for --port"
+            PORT="$2"; shift 2 ;;
+        --mirror)
+            USE_MIRROR=true; shift ;;
+        --help|-h) usage ;;
+        *) die "Unknown option: $1 (run with --help for usage)" ;;
+    esac
+done
+
+[[ -z "$INSTALL_PATH" ]] && die "--install-path is required"
+[[ "$PORT" =~ ^[0-9]+$ ]] || die "--port must be a number (got: $PORT)"
+[[ "$PORT" -ge 1 && "$PORT" -le 65535 ]] || die "--port must be 1–65535"
+
+resolve_real_user
+
+CANVAS_DIR="$INSTALL_PATH"
+
+printf "\n%s" "${BOLD}"
+echo "====================================================="
+echo "  Canvas LMS — Local Development Setup"
+echo "  Target:  $CANVAS_DIR"
+echo "  Port:    $PORT"
+echo "  Mirror:  $USE_MIRROR"
+echo "  User:    $REAL_USER"
+echo "====================================================="
+printf "%s\n" "${NC}"
+
+# =============================================================================
+# STEP 1 — Install prerequisites
+# =============================================================================
+install_prerequisites() {
+    log_step "Step 1: Checking and installing prerequisites"
+
+    # OS check
+    if grep -q 'VERSION_ID="24.04"' /etc/os-release 2>/dev/null; then
+        log_ok "Ubuntu 24.04 detected"
+    else
+        log_warn "Ubuntu 24.04 not confirmed — continuing, but results may vary"
+    fi
+
+    # Memory check
+    if command -v free &>/dev/null; then
+        local mem_gb
+        mem_gb=$(free -g | awk '/^Mem:/{print $2}')
+        if [[ "${mem_gb:-0}" -lt 8 ]]; then
+            log_warn "Only ${mem_gb} GB RAM — 8 GB+ recommended. Builds may be slow or OOM."
+        else
+            log_ok "RAM: ${mem_gb} GB"
+        fi
+    fi
+
+    # Disk check — check the target install path's filesystem
+    local check_path="$INSTALL_PATH"
+    [[ -d "$check_path" ]] || check_path="$(dirname "$check_path")"
+    [[ -d "$check_path" ]] || check_path="/"
+    local free_gb
+    free_gb=$(df -BG --output=avail "$check_path" | tail -1 | tr -d 'G ')
+    if [[ "${free_gb:-0}" -lt 20 ]]; then
+        log_warn "Only ${free_gb} GB free — Canvas build needs ~20 GB"
+    else
+        log_ok "Free disk: ${free_gb} GB"
+    fi
+
+    # ------------------------------------------------------------------
+    # Git & Python3
+    # ------------------------------------------------------------------
+    local basic_missing=()
+    command -v git     &>/dev/null || basic_missing+=("git")
+    command -v python3 &>/dev/null || basic_missing+=("python3")
+
+    if [[ ${#basic_missing[@]} -gt 0 ]]; then
+        log_info "Installing: ${basic_missing[*]}"
+        _sudo apt-get update -qq
+        _sudo apt-get install -y "${basic_missing[@]}"
+    fi
+
+    log_ok "Git:     $(git --version)"
+    log_ok "Python3: $(python3 --version)"
+
+    # ------------------------------------------------------------------
+    # Docker CE — use Docker's official APT repo, not Ubuntu GNU/Linux's docker.io.
+    # docker.io is stale and lacks docker-buildx-plugin / docker-compose-plugin.
+    # ------------------------------------------------------------------
+    local docker_ok=false
+    if command -v docker &>/dev/null \
+        && docker compose version &>/dev/null 2>&1 \
+        && docker buildx version &>/dev/null 2>&1; then
+        docker_ok=true
+    fi
+
+    # Also try sudo docker in case it's installed but not in PATH for this user
+    if [[ "$docker_ok" == false ]] && sudo docker compose version &>/dev/null 2>&1; then
+        docker_ok=true
+        DOCKER_CMD="sudo docker"
+        log_info "Docker found via sudo — will use 'sudo docker' for this session"
+    fi
+
+    if [[ "$docker_ok" == false ]]; then
+        log_info "Docker CE not found — installing from Docker's official APT repo"
+
+        # Strip any conflicting Ubuntu GNU/Linux-packaged docker variants
+        for pkg in docker.io docker-doc docker-compose docker-compose-v2 \
+                   podman-docker containerd runc; do
+            if dpkg -l "$pkg" &>/dev/null 2>&1; then
+                log_info "Removing conflicting package: $pkg"
+                _sudo apt-get remove -y "$pkg" || true
+            fi
+        done
+
+        _sudo apt-get update -qq
+        _sudo apt-get install -y ca-certificates curl gnupg lsb-release
+
+        # Docker's official GPG key — modern /etc/apt/keyrings method
+        _sudo install -m 0755 -d /etc/apt/keyrings
+        _sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+            -o /etc/apt/keyrings/docker.asc
+        _sudo chmod a+r /etc/apt/keyrings/docker.asc
+
+        # Add Docker's stable APT repo
+        echo \
+            "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] \
+https://download.docker.com/linux/ubuntu \
+$(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
+            | _sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+        _sudo apt-get update -qq
+        _sudo apt-get install -y \
+            docker-ce \
+            docker-ce-cli \
+            containerd.io \
+            docker-buildx-plugin \
+            docker-compose-plugin
+
+        _sudo systemctl enable --now docker
+        log_ok "Docker CE installed and started"
+    fi
+
+    # ------------------------------------------------------------------
+    # Docker group / access
+    #
+    # We never force a logout. Instead:
+    #   - If already root or in docker group → use "docker" directly
+    #   - Otherwise → add to group AND use "sudo docker" for this session
+    #     so the script completes without requiring a re-login
+    # ------------------------------------------------------------------
+    if [[ "$EUID" -eq 0 ]]; then
+        # Root can always talk to Docker
+        DOCKER_CMD="docker"
+    elif groups "$REAL_USER" 2>/dev/null | grep -qw docker; then
+        DOCKER_CMD="docker"
+        log_ok "User '$REAL_USER' is in the docker group"
+    else
+        log_info "Adding '$REAL_USER' to the docker group..."
+        _sudo usermod -aG docker "$REAL_USER"
+        # Use sudo docker for the rest of this run — no logout needed
+        DOCKER_CMD="sudo docker"
+        log_warn "Added '$REAL_USER' to the docker group."
+        log_warn "For future sessions, log out and back in to use docker without sudo."
+        log_warn "This install will continue using 'sudo docker' automatically."
+    fi
+
+    # Final reachability check
+    if ! $DOCKER_CMD info &>/dev/null; then
+        _sudo systemctl start docker || true
+        sleep 2
+        $DOCKER_CMD info &>/dev/null \
+            || die "Docker daemon is not reachable even with '$DOCKER_CMD'.\nTry: sudo systemctl start docker"
+    fi
+
+    log_ok "Docker:         $($DOCKER_CMD --version)"
+    log_ok "Docker Compose: $($DOCKER_CMD compose version)"
+    log_ok "Docker Buildx:  $($DOCKER_CMD buildx version)"
+    log_ok "Docker daemon:  running"
+
+    # Write the postgres image resolver script used by detect_postgres_image()
+    cat > /tmp/canvas_resolve_pg.py << 'RESOLVER'
+import sys, re
+from pathlib import Path
+
+df_text = Path(sys.argv[1]).read_text()
+dc_path = Path(sys.argv[2]) if len(sys.argv) > 2 else None
+
+# Collect ARG defaults from Dockerfile
+args = {}
+for m in re.finditer(r"^ARG\s+(\w+)(?:=(\S+))?", df_text, re.MULTILINE):
+    name, default = m.group(1), m.group(2)
+    if default:
+        args[name] = default.strip()
+
+# Collect build args from docker-compose.yml postgres service
+if dc_path and dc_path.exists():
+    dc_text = dc_path.read_text()
+    in_postgres = False
+    in_args = False
+    for line in dc_text.splitlines():
+        s = line.strip()
+        if re.match(r"^postgres\s*:", s):
+            in_postgres = True; in_args = False
+        elif in_postgres and re.match(r"^\w", s) and not s.startswith("postgres"):
+            in_postgres = False; in_args = False
+        elif in_postgres and s == "args:":
+            in_args = True
+        elif in_args:
+            m2 = re.match(r"[-\s]*(\w+)\s*[=:]\s*(\S+)", s)
+            if m2:
+                args[m2.group(1)] = m2.group(2).strip("\"'")
+            elif s and not s.startswith("-"):
+                in_args = False
+
+from_m = re.search(r"^FROM\s+(\S+)", df_text, re.MULTILINE)
+if not from_m:
+    sys.exit(1)
+
+resolved = re.sub(r"\$\{?(\w+)\}?", lambda m: args.get(m.group(1), ""), from_m.group(1))
+
+if "$" not in resolved and ("/" in resolved or ":" in resolved):
+    print(resolved.strip())
+else:
+    sys.exit(1)
+RESOLVER
+
+}
+
+# =============================================================================
+# STEP 2 — Clone Canvas LMS
+# =============================================================================
+clone_canvas() {
+    log_step "Step 2: Cloning Canvas LMS"
+
+    if [[ -d "$CANVAS_DIR/.git" ]]; then
+        log_warn "Repository already exists at $CANVAS_DIR — skipping clone"
+        return 0
+    fi
+
+    if [[ -e "$CANVAS_DIR" ]]; then
+        die "$CANVAS_DIR exists but is not a git repo. Remove it and re-run."
+    fi
+
+    # Create CANVAS_DIR with elevated permissions (needed for system paths like
+    # /opt), then hand ownership to the real user so git clone can write into it.
+    _sudo mkdir -p "$CANVAS_DIR"
+    if [[ "$REAL_USER" != "root" ]]; then
+        _sudo chown "$REAL_USER:$REAL_USER" "$CANVAS_DIR"
+    fi
+
+    local repo="$CANVAS_REPO"
+    [[ "$USE_MIRROR" == true ]] && repo="$CANVAS_MIRROR"
+
+    log_info "Cloning from: $repo"
+    # Clone as the real user so all files are owned correctly for the container.
+    if [[ "$EUID" -eq 0 && "$REAL_USER" != "root" ]]; then
+        sudo -u "$REAL_USER" git clone "$repo" "$CANVAS_DIR"
+    else
+        git clone "$repo" "$CANVAS_DIR"
+    fi || {
+        log_err "Clone failed."
+        [[ "$USE_MIRROR" == false ]] && log_info "Try again with --mirror if GitHub is slow or unavailable."
+        exit 1
+    }
+
+    log_ok "Canvas LMS cloned"
+}
+
+
+# =============================================================================
+# STEP 2b — Detect the correct postgres image from Canvas's own Dockerfile
+# =============================================================================
+detect_postgres_image() {
+    local pg_df="$CANVAS_DIR/docker-compose/postgres/Dockerfile"
+
+    if [[ ! -f "$pg_df" ]]; then
+        log_warn "postgres Dockerfile not found — defaulting to postgis:14-3.3"
+        POSTGIS_IMAGE="postgis/postgis:14-3.3"
+        return 0
+    fi
+
+    # Canvas uses variable FROM lines e.g. "FROM $POSTGRESIMAGE:$POSTGRES"
+    # We must resolve ARG defaults to get the real image name.
+    # If unresolvable, fall back to postgis:14-3.3 (current Canvas requirement).
+    local resolved
+    resolved="$(python3 /tmp/canvas_resolve_pg.py "$pg_df" "$CANVAS_DIR/docker-compose.yml" 2>/dev/null || true)"
+
+    if [[ -n "$resolved" ]]; then
+        log_info "Canvas postgres image resolved: $resolved"
+        POSTGIS_IMAGE="$resolved"
+    else
+        log_warn "Could not resolve postgres image from Dockerfile — using postgis:14-3.3"
+        POSTGIS_IMAGE="postgis/postgis:14-3.3"
+    fi
+    log_ok "Postgres image: $POSTGIS_IMAGE"
+}
+
+# =============================================================================
+# STEP 3 — Patch Dockerfiles
+#
+# WHY these patches are needed on Ubuntu 24.04:
+#
+# (a) Main Dockerfile: uses legacy `apt-key add` and unsigned apt repo lines.
+#     On modern Docker/Ubuntu GNU/Linux these are rejected or time out. Fix: add
+#     [trusted=yes] to the repo entries and neutralise the apt-key call.
+#
+# (b) PostGIS Dockerfile (docker-compose/postgres/Dockerfile): based on Debian
+#     Buster (EOL). deb.debian.org no longer serves Buster. Fix: redirect all
+#     apt sources to archive.debian.org and disable expiry checks.
+# =============================================================================
+apply_patches() {
+    log_step "Step 3: Patching Dockerfiles for Ubuntu 24.04 compatibility"
+
+    # --- (a) Main Canvas Dockerfile -------------------------------------------
+    local main_df="$CANVAS_DIR/Dockerfile"
+    if [[ -f "$main_df" ]]; then
+        python3 - "$main_df" <<'PYEOF'
+import sys, re
+from pathlib import Path
+
+path = Path(sys.argv[1])
+text = path.read_text()
+original = text
+
+# Mark nodesource/postgresql apt lines as trusted — avoids GPG failures
+text = text.replace(
+    'echo "deb https://deb.nodesource.com',
+    'echo "deb [trusted=yes] https://deb.nodesource.com'
+)
+text = text.replace(
+    'echo "deb http://apt.postgresql.org',
+    'echo "deb [trusted=yes] http://apt.postgresql.org'
+)
+
+# Neutralise apt-key pipeline — [trusted=yes] makes the key unnecessary
+text = text.replace(
+    "apt-key add - && apt-get update -qq && apt-get install",
+    "apt-key add - 2>/dev/null || true && (apt-get update -qq || true) && apt-get install"
+)
+
+# Remove keyserver fetches — they block or fail in modern/restricted environments
+text = re.sub(
+    r'apt-key adv --keyserver\s+\S+\s+--recv-keys\s+\S+[^\n]*\n',
+    '# apt-key adv removed — [trusted=yes] used instead\n',
+    text
+)
+
+if text != original:
+    path.write_text(text)
+    print("  Patched main Dockerfile")
+else:
+    print("  Main Dockerfile already up to date")
+PYEOF
+        log_ok "Main Dockerfile"
+    else
+        log_warn "Main Dockerfile not found — skipping (Canvas may have restructured)"
+    fi
+
+    # --- (b) PostGIS Dockerfile -----------------------------------------------
+    local pg_df="$CANVAS_DIR/docker-compose/postgres/Dockerfile"
+    if [[ -f "$pg_df" ]]; then
+        python3 - "$pg_df" <<'PYEOF'
+import sys, re
+from pathlib import Path
+
+path = Path(sys.argv[1])
+text = path.read_text()
+
+# Idempotency check
+if "archive.debian.org" in text and "99no-check-valid-until" in text:
+    print("  PostGIS Dockerfile already patched")
+    sys.exit(0)
+
+# Remove any previous incomplete attempt
+text = re.sub(
+    r'RUN\s+sed\s+-i.*?archive\.debian\.org.*?\n',
+    '',
+    text,
+    flags=re.DOTALL
+)
+
+# Redirect Buster/Bullseye/Bookworm sources to archive.debian.org,
+# remove *-updates suites (not in archive), disable apt expiry checks.
+archive_block = (
+    'RUN set -eux; \\\n'
+    '    mkdir -p /etc/apt/apt.conf.d; \\\n'
+    '    echo \'Acquire::Check-Valid-Until "false";\' '
+    '> /etc/apt/apt.conf.d/99no-check-valid-until; \\\n'
+    '    for f in /etc/apt/sources.list \\\n'
+    '              /etc/apt/sources.list.d/*.list \\\n'
+    '              /etc/apt/sources.list.d/*.sources; do \\\n'
+    '        [ -e "$$f" ] || continue; \\\n'
+    '        sed -i \\\n'
+    '            -e "s|http://deb.debian.org/debian|http://archive.debian.org/debian|g" \\\n'
+    '            -e "s|https://deb.debian.org/debian|http://archive.debian.org/debian|g" \\\n'
+    '            -e "s|http://security.debian.org/debian-security|http://archive.debian.org/debian-security|g" \\\n'
+    '            -e "s|https://security.debian.org/debian-security|http://archive.debian.org/debian-security|g" \\\n'
+    '            -e "/buster-updates/d" \\\n'
+    '            -e "/bullseye-updates/d" \\\n'
+    '            -e "/bookworm-updates/d" \\\n'
+    '            "$$f" 2>/dev/null || true; \\\n'
+    '    done\n'
+)
+
+# Insert right after the first FROM line
+text = re.sub(
+    r'(^FROM[^\n]*\n)',
+    r'\1' + archive_block + '\n',
+    text,
+    count=1,
+    flags=re.MULTILINE
+)
+
+path.write_text(text)
+print("  Patched PostGIS Dockerfile")
+PYEOF
+        log_ok "PostGIS Dockerfile"
+    else
+        log_warn "PostGIS Dockerfile not found — skipping"
+    fi
+}
+
+# =============================================================================
+# STEP 4 — Write Canvas config files
+#
+# PLACEHOLDER CREDENTIALS — local dev only.
+# DO NOT use these in any environment accessible from the internet.
+#
+#   DB password   : set in database.yml and the postgres container env
+#   Admin password: set in docker-compose.override.yml for first-run seeding
+#   Encryption key: generated fresh from /dev/urandom on each fresh install
+#
+# config/*.yml is already in Canvas's .gitignore — these files will not be
+# committed if you fork canvas-lms.
+# =============================================================================
+configure_canvas() {
+    log_step "Step 4: Writing Canvas config files"
+
+    # Copy Canvas's bundled example configs first — they contain correct
+    # boilerplate for all services. We then overwrite only what we need.
+    local example_dir="$CANVAS_DIR/docker-compose/config"
+    if [[ -d "$example_dir" ]]; then
+        log_info "Copying example configs from docker-compose/config/"
+        cp "$example_dir"/*.yml "$CANVAS_DIR/config/" 2>/dev/null || true
+        log_ok "Example configs copied"
+    else
+        log_warn "docker-compose/config/ not found — writing configs from scratch"
+    fi
+
+    mkdir -p "$CANVAS_DIR/config"
+
+    # Random 64-hex-char encryption key — unique per installation, never stored
+    # in source control. PLACEHOLDER: any 20+ char string works for dev.
+    local enc_key
+    # tr reads from /dev/urandom (infinite); head closes the pipe after 64 chars,
+    # causing SIGPIPE (exit 141). The || true suppresses that under set -euo pipefail.
+    enc_key="$(tr -dc 'a-f0-9' < /dev/urandom | head -c 64 || true)"
+
+    # PLACEHOLDER DB password — local only, matches the postgres service.
+    # Change this if you ever expose port 5432 outside localhost.
+    # PLACEHOLDER: must match Canvas postgres image init script which creates
+    # the canvas role with this password. Do not change without also rebuilding
+    # the postgres image with a matching password.
+    local db_pass="sekret"
+
+    # PLACEHOLDER admin credentials — first-run seed values only.
+    # Canvas will use these to create the initial admin account.
+    local admin_email="admin@canvas.local"
+    local admin_pass="ChangeMe_AfterSetup_1!"
+
+    # database.yml
+    cat > "$CANVAS_DIR/config/database.yml" <<EOF
+# PLACEHOLDER: password is for local dev only. Change if exposing postgres.
+development:
+  adapter: postgresql
+  encoding: utf8
+  database: canvas_development
+  host: postgres
+  username: canvas
+  password: ${db_pass}
+  timeout: 5000
+test:
+  adapter: postgresql
+  encoding: utf8
+  database: canvas_test
+  host: postgres
+  username: canvas
+  password: ${db_pass}
+  timeout: 5000
+EOF
+    log_ok "config/database.yml"
+
+    # domain.yml
+    cat > "$CANVAS_DIR/config/domain.yml" <<'EOF'
+development:
+  domain: localhost
+  ssl: false
+test:
+  domain: localhost
+  ssl: false
+EOF
+    log_ok "config/domain.yml"
+
+    # security.yml — encryption_key is the only valid key here.
+    # PLACEHOLDER: generated at install time. Never commit this file.
+    cat > "$CANVAS_DIR/config/security.yml" <<EOF
+# PLACEHOLDER: encryption_key is randomly generated at install time.
+# Never commit this file or share this value.
+development:
+  encryption_key: "${enc_key}"
+test:
+  encryption_key: "test_${enc_key}"
+EOF
+    log_ok "config/security.yml"
+
+    # outgoing_mail.yml — required for Canvas to boot without errors.
+    # PLACEHOLDER: localhost:25 is a no-op; no mail is actually delivered.
+    if [[ ! -f "$CANVAS_DIR/config/outgoing_mail.yml" ]]; then
+        cat > "$CANVAS_DIR/config/outgoing_mail.yml" <<'EOF'
+# PLACEHOLDER: local dev mail sink. Replace with real SMTP for shared installs.
+development:
+  address: localhost
+  port: 25
+  domain: localhost
+  outgoing_address: canvas@localhost
+  default_name: "Canvas LMS (local dev)"
+EOF
+        log_ok "config/outgoing_mail.yml"
+    else
+        log_ok "config/outgoing_mail.yml (already exists — not overwritten)"
+    fi
+
+    # redis.yml — always write this to guarantee correct format.
+    # Canvas changed 'servers:' to 'url:' in Nov 2023. We overwrite any copied
+    # example to ensure we always have the right key regardless of Canvas version.
+    cat > "$CANVAS_DIR/config/redis.yml" <<'EOF'
+development:
+  url: redis://redis:6379
+test:
+  url: redis://redis:6379
+EOF
+    log_ok "config/redis.yml"
+
+    # cache_store.yml
+    # MUST use memory_store here, not redis_store. Canvas loads cache_store.yml
+    # during Rails environment init which happens even for db:create. If redis_store
+    # is set, Canvas tries to connect to Redis before the DB exists and crashes.
+    # After `docker compose up -d` the app runs fine with redis_store — but for
+    # the setup rake tasks, memory_store is required to avoid the chicken-and-egg.
+    cat > "$CANVAS_DIR/config/cache_store.yml" <<'EOF'
+development:
+  cache_store: memory_store
+test:
+  cache_store: memory_store
+EOF
+    log_ok "config/cache_store.yml"
+
+    # docker-compose.override.yml
+    # PLACEHOLDER credentials below are local dev only.
+    cat > "$CANVAS_DIR/docker-compose.override.yml" <<EOF
+# Generated by canvas-setup.sh — do not commit this file.
+# PLACEHOLDER credentials below are for local development only.
+services:
+  web:
+    restart: unless-stopped
+    environment:
+      RAILS_ENV: development
+      DISABLE_SPRING: 1
+      # PLACEHOLDER: change these after first login
+      CANVAS_LMS_ADMIN_EMAIL: "${admin_email}"
+      CANVAS_LMS_ADMIN_PASSWORD: "${admin_pass}"
+      CANVAS_LMS_ACCOUNT_NAME: "Canvas Local Dev"
+      CANVAS_LMS_STATS_COLLECTION: opt_out
+    ports:
+      - "${PORT}:80"
+    volumes:
+      - .:/usr/src/app
+    depends_on:
+      - postgres
+      - redis
+  jobs:
+    restart: unless-stopped
+    environment:
+      RAILS_ENV: development
+      DISABLE_SPRING: 1
+    volumes:
+      - .:/usr/src/app
+    depends_on:
+      - postgres
+      - redis
+  postgres:
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5432:5432"
+  redis:
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6379:6379"
+EOF
+    log_ok "docker-compose.override.yml"
+
+    # Expose to the final summary
+    GENERATED_ADMIN_EMAIL="$admin_email"
+    GENERATED_ADMIN_PASS="$admin_pass"
+}
+
+# =============================================================================
+# STEP 5 — Pull base Docker images
+# =============================================================================
+pull_images() {
+    log_step "Step 5: Pulling Docker base images"
+
+    _pull_and_tag() {
+        local src="$1" dst="$2"
+        log_info "Pulling: $src"
+        $DOCKER_CMD pull "$src" || die "Failed to pull $src"
+        [[ "$src" != "$dst" ]] && $DOCKER_CMD tag "$src" "$dst"
+        log_ok "$dst"
+    }
+
+    if [[ "$USE_MIRROR" == true ]]; then
+        log_info "Using Docker mirror: $DOCKER_MIRROR"
+        _pull_and_tag "$DOCKER_MIRROR/$RUBY_IMAGE"          "$RUBY_IMAGE"
+        _pull_and_tag "$DOCKER_MIRROR/$POSTGIS_IMAGE"       "$POSTGIS_IMAGE"
+        _pull_and_tag "$DOCKER_MIRROR/library/$REDIS_IMAGE" "$REDIS_IMAGE"
+    else
+        _pull_and_tag "$RUBY_IMAGE"    "$RUBY_IMAGE"
+        _pull_and_tag "$POSTGIS_IMAGE" "$POSTGIS_IMAGE"
+        _pull_and_tag "$REDIS_IMAGE"   "$REDIS_IMAGE"
+    fi
+}
+
+# =============================================================================
+# STEP 6 — Build images, start services, install assets, seed database
+#
+# Follows the official Canvas Docker dev setup sequence from:
+#   doc/docker/developing_with_docker.md
+# =============================================================================
+build_and_start() {
+    cd "$CANVAS_DIR"
+    local dc="$DOCKER_CMD compose -f docker-compose.yml -f docker-compose.override.yml"
+
+    # --- Build ----------------------------------------------------------------
+    local host_uid
+    host_uid="$(id -u "$REAL_USER" 2>/dev/null || echo "0")"
+
+    log_step "Step 6: Building Docker images  (first run takes 10-30 min)"
+    if [[ "$host_uid" == "0" ]]; then
+        log_info "Building as root - skipping USER_ID remapping"
+        $dc build || die "Docker build failed"
+    else
+        log_info "Building with USER_ID=${host_uid} (user: $REAL_USER)"
+        $dc build --build-arg USER_ID="${host_uid}" || die "Docker build failed"
+    fi
+    log_ok "Build complete"
+
+    # --- Start postgres and redis FIRST, wait for them, then start web ------
+    # Starting everything at once risks web crashing before postgres is ready.
+    log_step "Step 7: Starting infrastructure (postgres, redis)"
+    $dc up -d postgres redis || die "Failed to start postgres/redis"
+    log_ok "postgres and redis started"
+
+    # --- Wait for PostgreSQL --------------------------------------------------
+    log_step "Waiting for PostgreSQL..."
+    local waited=0 max_wait=120
+    until $dc exec -T postgres pg_isready -U postgres &>/dev/null; do
+        sleep 3; waited=$((waited + 3))
+        log_info "  ${waited}s..."
+        [[ $waited -ge $max_wait ]] && die "PostgreSQL never started. Check: $dc logs postgres"
+    done
+    log_ok "PostgreSQL accepting connections"
+
+    # Create canvas role if Canvas's init scripts didn't
+    sleep 5
+    log_info "Ensuring canvas database role exists..."
+    $dc exec -T postgres psql -U postgres -c "
+        DO \$\$ BEGIN
+            IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'canvas') THEN
+                CREATE ROLE canvas SUPERUSER CREATEDB LOGIN PASSWORD 'sekret';
+            ELSE
+                ALTER ROLE canvas WITH SUPERUSER CREATEDB LOGIN PASSWORD 'sekret';
+            END IF;
+        END \$\$;
+    " || die "Failed to create canvas postgres role"
+    log_ok "canvas role ready"
+
+    # --- Now start web and jobs -----------------------------------------------
+    log_step "Step 8: Starting web and jobs containers"
+    $dc up -d web jobs || die "Failed to start web/jobs"
+
+    # Wait for web container to accept exec commands
+    local web_waited=0
+    until $dc exec -T web echo "ok" &>/dev/null; do
+        sleep 3; web_waited=$((web_waited + 3))
+        log_info "  ${web_waited}s..."
+        [[ $web_waited -ge 120 ]] && die "Web container never became ready. Check: $dc logs web"
+    done
+    log_ok "Web container ready"
+
+    # --- Install bundler-multilock ONCE in the running container --------------
+    # exec reuses the same running container filesystem, so the plugin
+    # installed here persists for all subsequent exec calls below.
+    log_info "Installing bundler-multilock plugin..."
+    $dc exec -T web bundle plugin install bundler-multilock 2>/dev/null || true
+
+    # --- Assets ---------------------------------------------------------------
+    log_step "Step 9: Installing Ruby gems and frontend assets  (slow)"
+    $dc exec -T --workdir /usr/src/app web ./script/install_assets.sh \
+        || die "install_assets.sh failed"
+    log_ok "Assets installed"
+
+    # --- Database setup -------------------------------------------------------
+    log_step "Step 10: Creating and seeding the database"
+    $dc exec -T web bash -c "RAILS_ENV=development bundle exec rake db:create db:initial_setup" \
+        || die "Database setup failed"
+    log_ok "Database created and seeded"
+
+    $dc exec -T web bash -c "RAILS_ENV=test bundle exec rake db:migrate" 2>/dev/null \
+        || log_warn "Test DB migration skipped (non-fatal)"
+
+    # --- Restart web and jobs -------------------------------------------------
+    # Passenger starts when the container first launches, before the database
+    # is seeded. A restart here ensures it picks up the fully seeded DB and
+    # compiled assets cleanly, so the browser actually gets a working Canvas.
+    log_step "Step 11: Restarting web services"
+    $dc restart web jobs || die "Failed to restart web/jobs"
+    log_ok "web and jobs restarted"
+
+    # --- Wait for Passenger to signal ready -----------------------------------
+    # Passenger logs "Passenger core online" the instant it has bound its socket
+    # and is ready to accept connections. We stream the container logs and break
+    # the moment that line appears — no polling interval, no arbitrary sleep.
+    # --tail 0 means we only see lines produced after we start following, so
+    # we don't match stale output from before the restart.
+    log_step "Waiting for Passenger to come online..."
+    local passenger_ready=false
+    while IFS= read -r log_line; do
+        if [[ "$log_line" == *"Passenger core online"* ]]; then
+            passenger_ready=true
+            break
+        fi
+    done < <(timeout 180 $dc logs --follow --tail 0 web 2>&1 || true)
+
+    if [[ "$passenger_ready" == true ]]; then
+        log_ok "Canvas is live at http://localhost:${PORT}"
+    else
+        log_warn "Passenger did not signal ready within 3 minutes."
+        log_warn "Canvas may still be starting up — check: $dc logs web"
+        log_warn "Then try: http://localhost:${PORT}"
+    fi
+}
+
+# =============================================================================
+# Main
+# =============================================================================
+install_prerequisites
+clone_canvas
+detect_postgres_image
+apply_patches
+configure_canvas
+pull_images
+build_and_start
+
+# =============================================================================
+# Done
+# =============================================================================
+printf "\n%s" "${BOLD}${GREEN}"
+echo "====================================================="
+echo "  Canvas LMS is ready!"
+echo "====================================================="
+printf "%s\n\n" "${NC}"
+echo "  URL:      http://localhost:${PORT}"
+echo "  Email:    ${GENERATED_ADMIN_EMAIL}"
+echo "  Password: ${GENERATED_ADMIN_PASS}"
+echo ""
+printf "  %sCHANGE THE PASSWORD after your first login.%s\n" "$YELLOW" "$NC"
+echo ""
+echo "  ── Useful commands ──────────────────────────────────"
+echo "  cd $CANVAS_DIR"
+echo ""
+echo "  Logs:    $DOCKER_CMD compose -f docker-compose.yml -f docker-compose.override.yml logs -f"
+echo "  Stop:    $DOCKER_CMD compose -f docker-compose.yml -f docker-compose.override.yml down"
+echo "  Start:   $DOCKER_CMD compose -f docker-compose.yml -f docker-compose.override.yml up -d"
+echo "  Console: $DOCKER_CMD compose -f docker-compose.yml -f docker-compose.override.yml exec web bundle exec rails console"
+echo ""
+printf "  %sNote:%s config/security.yml was generated with a random encryption key.\n" "$YELLOW" "$NC"
+echo "        Never commit that file or share its contents."
+echo ""

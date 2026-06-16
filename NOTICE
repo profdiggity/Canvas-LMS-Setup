@@ -1,7 +1,30 @@
+Canvas LMS Setup Toolkit
+
+Copyright (C) 2026 PrivacySafe Foundation Inc. https://privacysafe.foundation
+
+This project is licensed under the MIT License. See LICENSE for the full text.
+
+This toolkit automates the local installation of Canvas LMS, which is developed
+and maintained by Instructure, Inc. and licensed separately under the GNU Affero
+General Public License v3.0 (AGPL-3.0). Canvas LMS source code is available at:
+https://github.com/instructure/canvas-lms
+
+This project was inspired by the original Canvas LMS Setup work by swzhang,
+also licensed under the MIT License.
+
+Inspired-by project:
+Canvas-LMS-Setup by swzhang
+Copyright (c) 2026 swzhang
+License: MIT
+Website: https://github.com/swzhangf/Canvas-LMS-Setup
+
+The original MIT license notice for the above project is preserved below.
+
+-------------------------------------------------------------------------------
+
 MIT License
 
-Copyright (c) 2026 PrivacySafe Foundation Inc.
-https://privacysafe.foundation
+Copyright (c) 2026 swzhang
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

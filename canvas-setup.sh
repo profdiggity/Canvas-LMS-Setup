@@ -1128,30 +1128,51 @@ cat << BANNER
     docker compose -f \$CANVAS_DIR/docker-compose.yml \\
         -f \$CANVAS_DIR/docker-compose.override.yml logs -f
 
+  Press Enter for a login prompt on this console.
+
   *******************************************************************
 
 BANNER
+
+# Hold tty1 open so the banner stays visible instead of going blank.
+# Pressing Enter drops to a normal login prompt (agetty) without rebooting.
+read -r
+exec /sbin/agetty --noclear tty1 linux
 SPLASHEOF
     _sudo chmod +x "$splash_script"
     log_ok "Splash script: $splash_script"
 
+    # --- Disable getty on tty1 so it stops fighting our splash for the console.
+    # Without this, getty@tty1 sends SIGHUP to whatever else is attached to
+    # tty1, killing our splash mid-run (systemd reports this as
+    # "Main process exited, code=killed, status=1/HUP").
+    _sudo systemctl disable --now getty@tty1.service 2>/dev/null || true
+    log_ok "Disabled getty@tty1 (was competing with splash for the console)"
+
     # --- The systemd unit -----------------------------------------------------
+    # Conflicts= ensures systemd stops getty@tty1 before starting us, even if
+    # it gets re-enabled or started by something else later (e.g. a future
+    # apt upgrade). Type=simple + holding the process open (instead of
+    # oneshot) keeps us owning the TTY so nothing else can grab it back.
     _sudo tee "$splash_service" > /dev/null << SVCEOF
 [Unit]
 Description=Canvas LMS Boot Splash Screen
 After=canvas-lms.service network-online.target
 Requires=canvas-lms.service
 Wants=network-online.target
+Conflicts=getty@tty1.service
 
 [Service]
-Type=oneshot
-RemainAfterExit=yes
+Type=simple
 ExecStart=$splash_script
-StandardOutput=tty
 StandardInput=tty
+StandardOutput=tty
+StandardError=tty
 TTYPath=/dev/tty1
 TTYReset=yes
-TTYVHangup=no
+TTYVHangup=yes
+TTYVTDisallocate=yes
+Restart=no
 
 [Install]
 WantedBy=multi-user.target

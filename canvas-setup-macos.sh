@@ -405,6 +405,28 @@ detect_postgres_image() {
     log_ok "Postgres image: $POSTGIS_IMAGE"
 }
 
+
+# =============================================================================
+# STEP 2c — Detect correct Ruby/Passenger image from Canvas's Dockerfile
+# =============================================================================
+detect_ruby_image() {
+    local dockerfile="$CANVAS_DIR/Dockerfile"
+    if [[ ! -f "$dockerfile" ]]; then
+        log_warn "Canvas Dockerfile not found — keeping fallback: $RUBY_IMAGE"; return 0
+    fi
+    local ruby_ver
+    ruby_ver="$(grep -m1 '^ARG RUBY=' "$dockerfile" | cut -d= -f2 | tr -d '"' | tr -d "'")"
+    if [[ -z "$ruby_ver" ]]; then
+        log_warn "Could not read Ruby version from Dockerfile — keeping: $RUBY_IMAGE"; return 0
+    fi
+    local detected="instructure/ruby-passenger:${ruby_ver}-jammy"
+    if [[ "$detected" != "$RUBY_IMAGE" ]]; then
+        log_info "Canvas requires Ruby image: $detected (was: $RUBY_IMAGE)"
+        RUBY_IMAGE="$detected"
+    fi
+    log_ok "Ruby image: $RUBY_IMAGE"
+}
+
 # =============================================================================
 # STEP 3 — Patch Dockerfiles
 #
@@ -418,101 +440,63 @@ detect_postgres_image() {
 #     sources no longer resolve. Fix: redirect to archive.debian.org.
 # =============================================================================
 apply_patches() {
-    log_step "Step 3: Patching Dockerfiles"
+    log_step "Step 3: Checking Dockerfiles for compatibility patches"
 
-    # --- Main Canvas Dockerfile -----------------------------------------------
     local main_df="$CANVAS_DIR/Dockerfile"
     if [[ -f "$main_df" ]]; then
-        python3 - "$main_df" <<'PYEOF'
-import sys, re
-from pathlib import Path
-
-path = Path(sys.argv[1])
-text = path.read_text()
-original = text
-
-text = text.replace(
-    'echo "deb https://deb.nodesource.com',
-    'echo "deb [trusted=yes] https://deb.nodesource.com'
-)
-text = text.replace(
-    'echo "deb http://apt.postgresql.org',
-    'echo "deb [trusted=yes] http://apt.postgresql.org'
-)
-text = text.replace(
-    "apt-key add - && apt-get update -qq && apt-get install",
-    "apt-key add - 2>/dev/null || true && (apt-get update -qq || true) && apt-get install"
-)
-text = re.sub(
-    r'apt-key adv --keyserver\s+\S+\s+--recv-keys\s+\S+[^\n]*\n',
-    '# apt-key adv removed — [trusted=yes] used instead\n',
-    text
-)
-
-if text != original:
-    path.write_text(text)
-    print("  Patched main Dockerfile")
-else:
-    print("  Main Dockerfile already up to date")
-PYEOF
-        log_ok "Main Dockerfile"
+        if grep -q 'signed-by=' "$main_df" 2>/dev/null; then
+            log_ok "Main Dockerfile uses modern keyring setup — no patch needed"
+        else
+            log_warn "Main Dockerfile format unexpected — skipping to avoid corruption"
+        fi
     else
         log_warn "Main Dockerfile not found — skipping"
     fi
 
-    # --- PostGIS Dockerfile ---------------------------------------------------
     local pg_df="$CANVAS_DIR/docker-compose/postgres/Dockerfile"
-    if [[ -f "$pg_df" ]]; then
-        python3 - "$pg_df" <<'PYEOF'
+    if [[ ! -f "$pg_df" ]]; then
+        log_warn "Postgres Dockerfile not found — skipping"; return 0
+    fi
+
+    case "$POSTGIS_IMAGE" in
+        postgis/postgis:12-*|postgis/postgis:13-*)
+            log_info "Old PostGIS base ($POSTGIS_IMAGE) — applying Debian archive patch"
+            ;;
+        *)
+            log_ok "Postgres image $POSTGIS_IMAGE does not need Debian archive patching"
+            return 0
+            ;;
+    esac
+
+    python3 - "$pg_df" <<'INNERPY'
 import sys, re
 from pathlib import Path
-
 path = Path(sys.argv[1])
 text = path.read_text()
-
 if "archive.debian.org" in text and "99no-check-valid-until" in text:
-    print("  PostGIS Dockerfile already patched")
-    sys.exit(0)
-
-text = re.sub(
-    r'RUN\s+sed\s+-i.*?archive\.debian\.org.*?\n', '',
-    text, flags=re.DOTALL
-)
-
+    print("  Already patched"); sys.exit(0)
 archive_block = (
     'RUN set -eux; \\\n'
     '    mkdir -p /etc/apt/apt.conf.d; \\\n'
-    '    echo \'Acquire::Check-Valid-Until "false";\' '
-    '> /etc/apt/apt.conf.d/99no-check-valid-until; \\\n'
-    '    for f in /etc/apt/sources.list \\\n'
-    '              /etc/apt/sources.list.d/*.list \\\n'
-    '              /etc/apt/sources.list.d/*.sources; do \\\n'
+    '    echo \'Acquire::Check-Valid-Until "false";\' > /etc/apt/apt.conf.d/99no-check-valid-until; \\\n'
+    '    for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do \\\n'
     '        [ -e "$$f" ] || continue; \\\n'
     '        sed -i \\\n'
     '            -e "s|http://deb.debian.org/debian|http://archive.debian.org/debian|g" \\\n'
     '            -e "s|https://deb.debian.org/debian|http://archive.debian.org/debian|g" \\\n'
     '            -e "s|http://security.debian.org/debian-security|http://archive.debian.org/debian-security|g" \\\n'
     '            -e "s|https://security.debian.org/debian-security|http://archive.debian.org/debian-security|g" \\\n'
-    '            -e "/buster-updates/d" \\\n'
-    '            -e "/bullseye-updates/d" \\\n'
-    '            -e "/bookworm-updates/d" \\\n'
+    '            -e "/buster-updates/d" -e "/bullseye-updates/d" -e "/bookworm-updates/d" \\\n'
     '            "$$f" 2>/dev/null || true; \\\n'
     '    done\n'
 )
-
-text = re.sub(
-    r'(^FROM[^\n]*\n)', r'\1' + archive_block + '\n',
-    text, count=1, flags=re.MULTILINE
-)
-
+text = re.sub(r"(^FROM[^\n]*\n)", r"\1" + archive_block + "\n", text, count=1, flags=re.MULTILINE)
 path.write_text(text)
-print("  Patched PostGIS Dockerfile")
-PYEOF
-        log_ok "PostGIS Dockerfile"
-    else
-        log_warn "PostGIS Dockerfile not found — skipping"
-    fi
+print("  Patched old PostGIS Dockerfile")
+INNERPY
+    log_ok "Postgres Dockerfile"
 }
+
 
 # =============================================================================
 # STEP 4 — Write Canvas config files
@@ -584,16 +568,52 @@ test:
 EOF
     log_ok "config/domain.yml"
 
-    # security.yml — only encryption_key is valid here.
-    # PLACEHOLDER: randomly generated. Never commit this file.
+    # security.yml
+    # encryption_key:      used for cookie signing and general encryption.
+    # jwt_encryption_keys: required by Canvas LTI platform storage (JWT tokens).
+    #                      Must be an array of exactly 64-char hex strings.
+    #                      Canvas crashes on every dashboard load without this field.
+    # lti_iss:             LTI 1.3 issuer identifier. Must match what LTI tools expect.
+    # PLACEHOLDER: generated at install time. Never commit this file.
     cat > "$CANVAS_DIR/config/security.yml" <<EOF
-# PLACEHOLDER: generated at install time. Never commit or share this value.
+# PLACEHOLDER: randomly generated at install time. Never commit or share this file.
 development:
   encryption_key: "${enc_key}"
+  jwt_encryption_keys:
+    - "${enc_key}"
+  lti_iss: 'http://localhost:${PORT}'
 test:
-  encryption_key: "test_${enc_key}"
+  encryption_key: "${enc_key}"
+  jwt_encryption_keys:
+    - "${enc_key}"
+  lti_iss: 'http://localhost:${PORT}'
 EOF
     log_ok "config/security.yml"
+
+    # dynamic_settings.yml — Canvas uses this for optional services (RCE, LTI tools,
+    # Consul, etc.). Canvas ships an example at docker-compose/config/dynamic_settings.yml
+    # which our cp step above already copies. We write our own only if it wasn't copied,
+    # to ensure the file always exists with the canvas_security keys needed for LTI
+    # encryption. Without lti-encryption-secret/lti-signing-secret some LTI 1.3 flows fail.
+    if [[ ! -f "$CANVAS_DIR/config/dynamic_settings.yml" ]]; then
+        local lti_enc_secret lti_sign_secret
+        lti_enc_secret="$(LC_ALL=C tr -dc 'a-z0-9' < /dev/urandom | head -c 32 || true)"
+        lti_sign_secret="$(LC_ALL=C tr -dc 'a-z0-9' < /dev/urandom | head -c 32 || true)"
+        cat > "$CANVAS_DIR/config/dynamic_settings.yml" <<EOF
+# Generated by canvas-setup-macos.sh — safe to commit (no real secrets for local dev)
+development:
+  config:
+    canvas:
+      canvas:
+        encryption-secret: "${lti_enc_secret}"
+        signing-secret: "${lti_sign_secret}"
+      rich-content-service:
+        app-host: "localhost"
+EOF
+        log_ok "config/dynamic_settings.yml (generated)"
+    else
+        log_ok "config/dynamic_settings.yml (copied from Canvas example)"
+    fi
 
     # outgoing_mail.yml — Canvas requires this file to boot.
     # PLACEHOLDER: localhost:25 is a no-op; no mail is delivered.
@@ -663,6 +683,9 @@ ${platform_block:+    platform: linux/amd64}
       - "${PORT}:80"
     volumes:
       - .:/usr/src/app
+      - canvas_gems:/home/docker/.gem
+      - canvas_bundle:/home/docker/.bundle
+      - canvas_cache:/home/docker/.cache
     depends_on:
       - postgres
       - redis
@@ -674,6 +697,9 @@ ${platform_block:+    platform: linux/amd64}
       DISABLE_SPRING: 1
     volumes:
       - .:/usr/src/app
+      - canvas_gems:/home/docker/.gem
+      - canvas_bundle:/home/docker/.bundle
+      - canvas_cache:/home/docker/.cache
     depends_on:
       - postgres
       - redis
@@ -685,8 +711,21 @@ ${platform_block:+    platform: linux/amd64}
     restart: unless-stopped
     ports:
       - "127.0.0.1:6379:6379"
+
+volumes:
+  canvas_gems:
+  canvas_bundle:
+  canvas_cache:
 EOF
     log_ok "docker-compose.override.yml"
+
+    # .env sets COMPOSE_FILE so users can type plain "docker compose" commands
+    # without -f flags. All automated commands in this script still use explicit
+    # -f flags; this only helps with ad-hoc manual commands like "docker compose ps".
+    cat > "$CANVAS_DIR/.env" << 'DOTENV'
+COMPOSE_FILE=docker-compose.yml:docker-compose.override.yml
+DOTENV
+    log_ok ".env (COMPOSE_FILE set — plain 'docker compose' commands now work)"
 
     GENERATED_ADMIN_EMAIL="$admin_email"
     GENERATED_ADMIN_PASS="$admin_pass"
@@ -698,8 +737,7 @@ EOF
 pull_images() {
     log_step "Step 5: Pulling Docker base images"
 
-    # On Apple Silicon, pull the amd64 variants explicitly so Docker caches
-    # the right architecture before the build step.
+    # On Apple Silicon pull amd64 variants explicitly
     local pull_flags=""
     [[ -n "$PLATFORM_ARG" ]] && pull_flags="--platform linux/amd64"
 
@@ -712,13 +750,23 @@ pull_images() {
         log_ok "$dst"
     }
 
+    _mirror_image() {
+        local image="$1"
+        if [[ "$image" == */* ]]; then
+            printf '%s/%s\n' "$DOCKER_MIRROR" "$image"
+        else
+            printf '%s/library/%s\n' "$DOCKER_MIRROR" "$image"
+        fi
+    }
+
     if [[ "$USE_MIRROR" == true ]]; then
         log_info "Using Docker mirror: $DOCKER_MIRROR"
-        _pull "$DOCKER_MIRROR/$RUBY_IMAGE"          "$RUBY_IMAGE"
-        _pull "$DOCKER_MIRROR/$POSTGIS_IMAGE"       "$POSTGIS_IMAGE"
-        _pull "$DOCKER_MIRROR/library/$REDIS_IMAGE" "$REDIS_IMAGE"
+        _pull "$(_mirror_image "$RUBY_IMAGE")"    "$RUBY_IMAGE"
+        _pull "$(_mirror_image "$POSTGIS_IMAGE")" "$POSTGIS_IMAGE"
+        _pull "$(_mirror_image "$REDIS_IMAGE")"   "$REDIS_IMAGE"
     else
-        _pull "$RUBY_IMAGE"    "$RUBY_IMAGE"
+        # Non-mirror: Ruby base image is fetched by "docker compose build --pull"
+        log_info "Pulling postgres and redis (Ruby image fetched during build)"
         _pull "$POSTGIS_IMAGE" "$POSTGIS_IMAGE"
         _pull "$REDIS_IMAGE"   "$REDIS_IMAGE"
     fi
@@ -731,28 +779,27 @@ build_and_start() {
     cd "$CANVAS_DIR"
     local dc="docker compose -f docker-compose.yml -f docker-compose.override.yml"
 
-    # --- Build ----------------------------------------------------------------
     log_step "Step 6: Building Docker images"
     if [[ "$ARCH" == "arm64" ]]; then
-        log_info "Apple Silicon: building with --platform linux/amd64 (Rosetta)"
-        log_info "This may take 20-45 min on first run — the emulated build is slower."
-        DOCKER_DEFAULT_PLATFORM=linux/amd64 $dc build \
+        log_info "Apple Silicon: building with --platform linux/amd64 (Rosetta 2)"
+        log_info "First run may take 20-45 min on Apple Silicon — this is normal."
+        DOCKER_DEFAULT_PLATFORM=linux/amd64 $dc build --pull \
             || die "Docker build failed — check output above"
     else
         log_info "First run takes 10-20 min."
-        $dc build || die "Docker build failed — check output above"
+        $dc build --pull || die "Docker build failed — check output above"
     fi
     log_ok "Build complete"
 
-    # --- Start infrastructure first -------------------------------------------
-    # Postgres and Redis must be healthy before the web container starts.
-    # Starting them separately prevents web from crashing on boot because
-    # its database/cache connections aren't available yet.
-    log_step "Step 7: Starting postgres and redis"
+    log_step "Step 7: Resetting app containers from any previous failed run"
+    $dc stop web jobs &>/dev/null || true
+    $dc rm -f web jobs &>/dev/null || true
+    log_ok "web/jobs reset"
+
+    log_step "Step 8: Starting infrastructure (postgres, redis)"
     $dc up -d postgres redis || die "Failed to start postgres/redis"
     log_ok "postgres and redis started"
 
-    # --- Wait for PostgreSQL --------------------------------------------------
     log_step "Waiting for PostgreSQL..."
     local waited=0
     until $dc exec -T postgres pg_isready -U postgres &>/dev/null; do
@@ -762,9 +809,6 @@ build_and_start() {
     done
     log_ok "PostgreSQL accepting connections"
 
-    # Canvas's postgres image should create the canvas role via init scripts,
-    # but those scripts are unreliable across versions. We ensure the role
-    # exists ourselves — idempotent and safe to run either way.
     sleep 5
     log_info "Ensuring canvas database role exists..."
     $dc exec -T postgres psql -U postgres -c "
@@ -778,77 +822,81 @@ build_and_start() {
     " || die "Failed to create canvas postgres role"
     log_ok "canvas role ready"
 
-    # --- Setup via run --rm (temporary containers) ----------------------------
-    # We do NOT start the web container yet. All setup tasks run in temporary
-    # containers (run --rm) that are destroyed when they finish. The serving
-    # web container starts fresh via up -d with no prior state — no stale PID
-    # files, no old unix sockets, no leftover nginx processes.
-    #
-    # On Apple Silicon, DOCKER_DEFAULT_PLATFORM ensures run --rm uses amd64.
-    # bundler-multilock is reinstalled at the start of each bash -c because
-    # it lives in the container home dir and does not survive container exit.
+    # --- Setup via two-step run --rm ------------------------------------------
+    # Step 1 (root): create named-volume dirs with correct ownership, wipe
+    #   stale Yarn cache from any previous failed attempt.
+    # Step 2 (docker user, login shell): install gems + assets, seed DB.
+    #   bash -lc loads GEM_HOME / BUNDLE_APP_CONFIG / PATH from the user profile
+    #   so everything resolves exactly as Canvas expects.
+    #   Named volumes (canvas_gems, canvas_bundle, canvas_cache) persist gems
+    #   into the serving containers after run --rm exits.
     [[ "$ARCH" == "arm64" ]] && export DOCKER_DEFAULT_PLATFORM=linux/amd64
 
-    # All setup steps in one container — gems from install_assets.sh
-    # (including git-sourced gems like authlogic) remain available for
-    # rake tasks. Separate run --rm calls destroy the gem cache on exit.
-    log_step "Step 8: Installing assets and seeding database  (slow — 20-45 min on Apple Silicon)"
-    $dc run --rm --no-deps web bash -c "
-        set -e
+    log_step "Step 9: Installing assets and seeding database  (slow — 20-45 min)"
 
-        echo '--- Installing bundler-multilock plugin ---'
+    $dc run --rm --no-deps --user root web bash -lc '
+        set -e
+        echo "--- Preparing named-volume directories ---"
+        mkdir -p /home/docker/.cache /home/docker/.gem /home/docker/.bundle
+        rm -rf /home/docker/.cache/yarn-canvas/v6 \
+               /home/docker/.cache/yarn \
+               /home/docker/.cache/yarn-v6 \
+               /tmp/yarn-cache-* /tmp/yarn-*
+        chown -R docker:docker /home/docker/.cache /home/docker/.gem /home/docker/.bundle
+    ' || die "Failed to prepare volume directories"
+
+    $dc run --rm --no-deps web bash -lc '
+        set -e
+        export HOME=/home/docker
+
+        echo "--- Cleaning any stale Yarn cache ---"
+        yarn cache clean --all 2>/dev/null || yarn cache clean 2>/dev/null || true
+
+        echo "--- Installing bundler-multilock plugin ---"
         bundle plugin install bundler-multilock || true
 
-        echo '--- Installing Ruby gems and frontend assets ---'
+        echo "--- Installing Ruby gems and frontend assets ---"
         ./script/install_assets.sh
 
-        echo '--- Creating and seeding the database ---'
+        echo "--- Creating and seeding the database ---"
         RAILS_ENV=development bundle exec rake db:create db:initial_setup
 
-        echo '--- Migrating test database ---'
+        echo "--- Migrating test database ---"
         RAILS_ENV=test bundle exec rake db:migrate || true
-    " || die "Setup failed — check output above"
+    ' || die "Setup failed — check output above"
     log_ok "Assets installed and database seeded"
 
-    # --- Start all services ---------------------------------------------------
-    # The web container starts here for the FIRST time as a serving container.
-    # Volumes already have compiled assets and a fully seeded database.
     log_step "Step 10: Starting all Canvas services"
     $dc up -d || die "Failed to start Canvas services"
     log_ok "All services started"
 
-    # --- Wait for Passenger to signal ready -----------------------------------
-    # Passenger logs "Passenger core online" the instant it is bound and ready.
-    # --tail 0 ensures we only see lines from this fresh startup.
     log_step "Waiting for Passenger to come online..."
     local passenger_ready=false
     while IFS= read -r log_line; do
         if [[ "$log_line" == *"Passenger core online"* ]]; then
-            passenger_ready=true
-            break
+            passenger_ready=true; break
         fi
     done < <(timeout 180 $dc logs --follow --tail 0 web 2>&1 || true)
 
     if [[ "$passenger_ready" == true ]]; then
         log_ok "Passenger online"
     else
-        log_warn "Passenger did not signal ready within 3 minutes."
+        log_warn "Passenger signal not seen within 3 minutes — Canvas may still be loading"
         log_warn "Check: $dc logs web"
     fi
 
-    # --- Verify HTTP is actually reachable ------------------------------------
-    log_step "Verifying HTTP connectivity on port ${PORT}..."
+    log_step "Verifying HTTP on port ${PORT}..."
     local http_waited=0
     until curl -s --connect-timeout 3 -o /dev/null "http://localhost:${PORT}" &>/dev/null; do
         sleep 3; http_waited=$(( http_waited + 3 ))
         log_info "  ${http_waited}s..."
-        if [[ $http_waited -ge 60 ]]; then
-            log_warn "Port ${PORT} not responding after 60s."
+        if [[ $http_waited -ge 120 ]]; then
+            log_warn "Port ${PORT} not responding after 120s."
             log_warn "Check: $dc logs --tail 40 web"
             break
         fi
     done
-    [[ $http_waited -lt 60 ]] && log_ok "Canvas is live at http://localhost:${PORT}"
+    [[ $http_waited -lt 120 ]] && log_ok "Canvas is live at http://localhost:${PORT}"
 }
 
 
@@ -924,10 +972,21 @@ cd "${CANVAS_DIR}" || exit 1
 # On Apple Silicon, ensure amd64 images are used (Canvas images are amd64-only)
 [[ "\$(uname -m)" == "arm64" ]] && export DOCKER_DEFAULT_PLATFORM=linux/amd64
 
-exec docker compose \\
+docker compose \\
     -f docker-compose.yml \\
     -f docker-compose.override.yml \\
     up -d
+
+# Wait until Canvas responds, then show a macOS notification
+waited=0
+while ! curl -s --connect-timeout 3 -o /dev/null "http://localhost:${PORT}" 2>/dev/null; do
+    sleep 5; waited=\$((waited + 5))
+    [[ \$waited -ge 300 ]] && break
+done
+
+if curl -s --connect-timeout 3 -o /dev/null "http://localhost:${PORT}" 2>/dev/null; then
+    osascript -e 'display notification "Open http://localhost:${PORT} in your browser" with title "Canvas LMS is ready" subtitle "admin@canvas.local"' 2>/dev/null || true
+fi
 EOF
     chmod +x "$wrapper_path"
     log_ok "Wrapper: $wrapper_path"
@@ -972,6 +1031,7 @@ EOF
 install_prerequisites
 clone_canvas
 detect_postgres_image
+detect_ruby_image
 apply_patches
 configure_canvas
 pull_images
@@ -987,7 +1047,15 @@ echo "====================================================="
 echo "  Canvas LMS is ready!"
 echo "====================================================="
 printf "%s\n\n" "${NC}"
-echo "  URL:      http://localhost:${PORT}"
+
+# Detect LAN IP on macOS (try en0=WiFi, en1=Ethernet, fallback to en0 IP)
+HOST_IP="$(ipconfig getifaddr en0 2>/dev/null     || ipconfig getifaddr en1 2>/dev/null     || ifconfig | grep 'inet ' | grep -v '127.0.0.1' | awk '{print $2}' | head -1     || echo "localhost")"
+
+echo "  URL (this machine):   http://localhost:${PORT}"
+echo "  URL (network):        http://${HOST_IP}:${PORT}"
+
+# macOS notification
+osascript -e "display notification \"Open http://localhost:${PORT} in your browser\" with title \"Canvas LMS is ready\" subtitle \"admin@canvas.local\"" 2>/dev/null || true
 echo "  Email:    ${GENERATED_ADMIN_EMAIL}"
 echo "  Password: ${GENERATED_ADMIN_PASS}"
 echo ""

@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="screenshot00.png" alt="Virtual Machine">
+</p>
+
 # Canvas LMS Setup Toolkit
 
 > Fully automated Canvas LMS local development setup for Ubuntu GNU/Linux, macOS, and Windows

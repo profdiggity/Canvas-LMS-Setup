@@ -1,18 +1,24 @@
 #!/usr/bin/env bash
 # SPDX-FileCopyrightText: 2026 PrivacySafe Foundation, Inc.
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: AGPL-3.0-or-later
 #
-# canvas-setup-macos.sh — Canvas LMS local development installer for macOS
+# canvas-setup-macos.sh: Canvas LMS local development installer for macOS
 #
 # Part of the Canvas LMS Setup Toolkit by PrivacySafe Foundation, Inc.
-# MIT License — see LICENSE file or https://opensource.org/licenses/MIT
+# This file is free software licensed under the GNU Affero General Public
+# License v3.0 or later. See LICENSE.
 #
-# Canvas LMS is open-source software developed by Instructure, Inc. and
-# licensed under the GNU Affero General Public License v3.0 (AGPL-3.0).
+# Canvas LMS is free software developed by Instructure, Inc. and licensed
+# under the GNU Affero General Public License v3.0 (AGPL-3.0).
 # Source: https://github.com/instructure/canvas-lms
 #
 # Inspired by original work by swzhang
 # https://github.com/swzhangf/Canvas-LMS-Setup
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+# FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for more
+# details.
 #
 # =============================================================================
 # Usage:
@@ -55,7 +61,7 @@ CANVAS_REPO="https://github.com/instructure/canvas-lms.git"
 CANVAS_MIRROR="https://gitee.com/xiong-yuhui/canvas-Lms.git"
 DOCKER_MIRROR="docker.1ms.run"
 
-# Canvas base images — postgres image is detected dynamically after clone
+# Canvas base images : postgres image is detected dynamically after clone
 RUBY_IMAGE="instructure/ruby-passenger:2.7"
 POSTGIS_IMAGE="postgis/postgis:14-3.3"   # fallback; overridden by detect_postgres_image()
 REDIS_IMAGE="redis:alpine"
@@ -132,14 +138,14 @@ done
 INSTALL_PATH="${INSTALL_PATH/#\~/$HOME}"
 CANVAS_DIR="$INSTALL_PATH"
 
-# Do not run as root on macOS — Docker Desktop handles permissions
+# Do not run as root on macOS : Docker Desktop handles permissions
 if [[ "$EUID" -eq 0 ]]; then
     die "Do not run this script as root on macOS. Run as your normal user account."
 fi
 
 printf "\n%s" "${BOLD}"
 echo "====================================================="
-echo "  Canvas LMS — macOS Local Development Setup"
+echo "  Canvas LMS : macOS Local Development Setup"
 echo "  Target:  $CANVAS_DIR"
 echo "  Port:    $PORT"
 echo "  Mirror:  $USE_MIRROR"
@@ -147,13 +153,13 @@ echo "====================================================="
 printf "%s\n" "${NC}"
 
 # =============================================================================
-# STEP 1 — Prerequisites
+# STEP 1 : Prerequisites
 # =============================================================================
 install_prerequisites() {
     log_step "Step 1: Checking and installing prerequisites"
 
     # ---------------------------------------------------------------
-    # macOS version check — require Monterey (12) or later
+    # macOS version check : require Monterey (12) or later
     # ---------------------------------------------------------------
     local macos_major
     macos_major=$(sw_vers -productVersion | cut -d. -f1)
@@ -174,7 +180,7 @@ install_prerequisites() {
     if [[ "$ARCH" == "arm64" ]]; then
         PLATFORM_ARG="--platform linux/amd64"
         log_warn "Apple Silicon (arm64) detected."
-        log_warn "Canvas images are amd64-only — will use Rosetta 2 emulation."
+        log_warn "Canvas images are amd64-only : will use Rosetta 2 emulation."
         log_warn "Builds will be slower than on Intel. This is normal."
     else
         PLATFORM_ARG=""
@@ -182,7 +188,7 @@ install_prerequisites() {
     fi
 
     # ---------------------------------------------------------------
-    # Memory — warn if macOS has less than 8 GB
+    # Memory : warn if macOS has less than 8 GB
     # Also remind about Docker Desktop's own memory limit (Settings →
     # Resources → Memory). Canvas needs at least 4 GB allocated there.
     # ---------------------------------------------------------------
@@ -190,7 +196,7 @@ install_prerequisites() {
     mem_bytes=$(sysctl -n hw.memsize 2>/dev/null || echo 0)
     mem_gb=$(( mem_bytes / 1024 / 1024 / 1024 ))
     if [[ "${mem_gb:-0}" -lt 8 ]]; then
-        log_warn "Only ${mem_gb} GB RAM detected — 8 GB+ recommended."
+        log_warn "Only ${mem_gb} GB RAM detected : 8 GB+ recommended."
     else
         log_ok "RAM: ${mem_gb} GB"
     fi
@@ -207,16 +213,16 @@ install_prerequisites() {
     free_kb=$(df -k "$check_path" | tail -1 | awk '{print $4}')
     free_gb=$(( free_kb / 1024 / 1024 ))
     if [[ "${free_gb:-0}" -lt 25 ]]; then
-        log_warn "Only ${free_gb} GB free — Canvas build + images need ~25 GB"
+        log_warn "Only ${free_gb} GB free : Canvas build + images need ~25 GB"
     else
         log_ok "Free disk: ${free_gb} GB"
     fi
 
     # ---------------------------------------------------------------
-    # Homebrew — required for git, python3, and Docker Desktop install
+    # Homebrew : required for git, python3, and Docker Desktop install
     # ---------------------------------------------------------------
     if ! command -v brew &>/dev/null; then
-        log_info "Homebrew not found — installing..."
+        log_info "Homebrew not found : installing..."
         /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" \
             || die "Homebrew installation failed. Install it manually from https://brew.sh then re-run."
     fi
@@ -239,7 +245,7 @@ install_prerequisites() {
     log_ok "Git: $(git --version)"
 
     # ---------------------------------------------------------------
-    # Python 3 — used for Dockerfile patching
+    # Python 3 : used for Dockerfile patching
     # ---------------------------------------------------------------
     if ! command -v python3 &>/dev/null; then
         log_info "Installing python3..."
@@ -271,9 +277,9 @@ install_prerequisites() {
         exit 0
     fi
 
-    # Docker is on PATH — make sure the daemon is actually running
+    # Docker is on PATH : make sure the daemon is actually running
     if ! docker info &>/dev/null; then
-        log_info "Docker Desktop is not running — attempting to start it..."
+        log_info "Docker Desktop is not running : attempting to start it..."
         open -a Docker 2>/dev/null || open -a "Docker Desktop" 2>/dev/null || true
 
         local waited=0
@@ -286,7 +292,7 @@ install_prerequisites() {
         done
     fi
 
-    # Verify compose and buildx — both ship with Docker Desktop
+    # Verify compose and buildx : both ship with Docker Desktop
     docker compose version &>/dev/null \
         || die "Docker Compose plugin not found. Update Docker Desktop to version 4.x or later."
     docker buildx version &>/dev/null \
@@ -348,13 +354,13 @@ RESOLVER
 }
 
 # =============================================================================
-# STEP 2 — Clone Canvas LMS
+# STEP 2 : Clone Canvas LMS
 # =============================================================================
 clone_canvas() {
     log_step "Step 2: Cloning Canvas LMS"
 
     if [[ -d "$CANVAS_DIR/.git" ]]; then
-        log_warn "Repository already exists at $CANVAS_DIR — skipping clone"
+        log_warn "Repository already exists at $CANVAS_DIR : skipping clone"
         return 0
     fi
 
@@ -377,13 +383,13 @@ clone_canvas() {
 }
 
 # =============================================================================
-# STEP 2b — Detect the correct postgres image from Canvas's own Dockerfile
+# STEP 2b : Detect the correct postgres image from Canvas's own Dockerfile
 # =============================================================================
 detect_postgres_image() {
     local pg_df="$CANVAS_DIR/docker-compose/postgres/Dockerfile"
 
     if [[ ! -f "$pg_df" ]]; then
-        log_warn "postgres Dockerfile not found — defaulting to postgis:14-3.3"
+        log_warn "postgres Dockerfile not found : defaulting to postgis:14-3.3"
         POSTGIS_IMAGE="postgis/postgis:14-3.3"
         return 0
     fi
@@ -399,7 +405,7 @@ detect_postgres_image() {
         log_info "Canvas postgres image resolved: $resolved"
         POSTGIS_IMAGE="$resolved"
     else
-        log_warn "Could not resolve postgres image — defaulting to postgis:14-3.3"
+        log_warn "Could not resolve postgres image : defaulting to postgis:14-3.3"
         POSTGIS_IMAGE="postgis/postgis:14-3.3"
     fi
     log_ok "Postgres image: $POSTGIS_IMAGE"
@@ -407,17 +413,17 @@ detect_postgres_image() {
 
 
 # =============================================================================
-# STEP 2c — Detect correct Ruby/Passenger image from Canvas's Dockerfile
+# STEP 2c : Detect correct Ruby/Passenger image from Canvas's Dockerfile
 # =============================================================================
 detect_ruby_image() {
     local dockerfile="$CANVAS_DIR/Dockerfile"
     if [[ ! -f "$dockerfile" ]]; then
-        log_warn "Canvas Dockerfile not found — keeping fallback: $RUBY_IMAGE"; return 0
+        log_warn "Canvas Dockerfile not found : keeping fallback: $RUBY_IMAGE"; return 0
     fi
     local ruby_ver
     ruby_ver="$(grep -m1 '^ARG RUBY=' "$dockerfile" | cut -d= -f2 | tr -d '"' | tr -d "'")"
     if [[ -z "$ruby_ver" ]]; then
-        log_warn "Could not read Ruby version from Dockerfile — keeping: $RUBY_IMAGE"; return 0
+        log_warn "Could not read Ruby version from Dockerfile : keeping: $RUBY_IMAGE"; return 0
     fi
     local detected="instructure/ruby-passenger:${ruby_ver}-jammy"
     if [[ "$detected" != "$RUBY_IMAGE" ]]; then
@@ -428,7 +434,7 @@ detect_ruby_image() {
 }
 
 # =============================================================================
-# STEP 3 — Patch Dockerfiles
+# STEP 3 : Patch Dockerfiles
 #
 # These patches fix issues in Canvas's Dockerfiles that are unrelated to macOS
 # but affect all Docker builds:
@@ -445,22 +451,22 @@ apply_patches() {
     local main_df="$CANVAS_DIR/Dockerfile"
     if [[ -f "$main_df" ]]; then
         if grep -q 'signed-by=' "$main_df" 2>/dev/null; then
-            log_ok "Main Dockerfile uses modern keyring setup — no patch needed"
+            log_ok "Main Dockerfile uses modern keyring setup : no patch needed"
         else
-            log_warn "Main Dockerfile format unexpected — skipping to avoid corruption"
+            log_warn "Main Dockerfile format unexpected : skipping to avoid corruption"
         fi
     else
-        log_warn "Main Dockerfile not found — skipping"
+        log_warn "Main Dockerfile not found : skipping"
     fi
 
     local pg_df="$CANVAS_DIR/docker-compose/postgres/Dockerfile"
     if [[ ! -f "$pg_df" ]]; then
-        log_warn "Postgres Dockerfile not found — skipping"; return 0
+        log_warn "Postgres Dockerfile not found : skipping"; return 0
     fi
 
     case "$POSTGIS_IMAGE" in
         postgis/postgis:12-*|postgis/postgis:13-*)
-            log_info "Old PostGIS base ($POSTGIS_IMAGE) — applying Debian archive patch"
+            log_info "Old PostGIS base ($POSTGIS_IMAGE) : applying Debian archive patch"
             ;;
         *)
             log_ok "Postgres image $POSTGIS_IMAGE does not need Debian archive patching"
@@ -499,17 +505,17 @@ INNERPY
 
 
 # =============================================================================
-# STEP 4 — Write Canvas config files
+# STEP 4 : Write Canvas config files
 #
-# PLACEHOLDER CREDENTIALS — local dev only.
+# PLACEHOLDER CREDENTIALS : local dev only.
 # DO NOT use in any environment accessible from the internet.
 #
-# config/*.yml is listed in Canvas's .gitignore — will not be committed.
+# config/*.yml is listed in Canvas's .gitignore : will not be committed.
 # =============================================================================
 configure_canvas() {
     log_step "Step 4: Writing Canvas config files"
 
-    # Copy Canvas's bundled example configs first — they contain correct
+    # Copy Canvas's bundled example configs first : they contain correct
     # boilerplate. We overwrite only what we need to customise.
     local example_dir="$CANVAS_DIR/docker-compose/config"
     if [[ -d "$example_dir" ]]; then
@@ -517,21 +523,21 @@ configure_canvas() {
         cp "$example_dir"/*.yml "$CANVAS_DIR/config/" 2>/dev/null || true
         log_ok "Example configs copied"
     else
-        log_warn "docker-compose/config/ not found — writing configs from scratch"
+        log_warn "docker-compose/config/ not found : writing configs from scratch"
     fi
 
     mkdir -p "$CANVAS_DIR/config"
 
-    # PLACEHOLDER encryption key — generated fresh on each install.
+    # PLACEHOLDER encryption key : generated fresh on each install.
     # tr reads /dev/urandom infinitely; head closes the pipe after 64 chars.
     # The || true prevents SIGPIPE from killing the script under set -euo pipefail.
     local enc_key
     enc_key="$(tr -dc 'a-f0-9' < /dev/urandom | head -c 64 || true)"
 
-    # PLACEHOLDER DB password — must match Canvas's postgres image init script
+    # PLACEHOLDER DB password : must match Canvas's postgres image init script
     local db_pass="sekret"
 
-    # PLACEHOLDER admin credentials — used only for first-run seeding
+    # PLACEHOLDER admin credentials : used only for first-run seeding
     local admin_email="admin@canvas.local"
     local admin_pass="ChangeMe_AfterSetup_1!"
 
@@ -590,7 +596,7 @@ test:
 EOF
     log_ok "config/security.yml"
 
-    # dynamic_settings.yml — Canvas uses this for optional services (RCE, LTI tools,
+    # dynamic_settings.yml : Canvas uses this for optional services (RCE, LTI tools,
     # Consul, etc.). Canvas ships an example at docker-compose/config/dynamic_settings.yml
     # which our cp step above already copies. We write our own only if it wasn't copied,
     # to ensure the file always exists with the canvas_security keys needed for LTI
@@ -600,7 +606,7 @@ EOF
         lti_enc_secret="$(LC_ALL=C tr -dc 'a-z0-9' < /dev/urandom | head -c 32 || true)"
         lti_sign_secret="$(LC_ALL=C tr -dc 'a-z0-9' < /dev/urandom | head -c 32 || true)"
         cat > "$CANVAS_DIR/config/dynamic_settings.yml" <<EOF
-# Generated by canvas-setup-macos.sh — safe to commit (no real secrets for local dev)
+# Generated by canvas-setup-macos.sh : safe to commit (no real secrets for local dev)
 development:
   config:
     canvas:
@@ -615,7 +621,7 @@ EOF
         log_ok "config/dynamic_settings.yml (copied from Canvas example)"
     fi
 
-    # outgoing_mail.yml — Canvas requires this file to boot.
+    # outgoing_mail.yml : Canvas requires this file to boot.
     # PLACEHOLDER: localhost:25 is a no-op; no mail is delivered.
     if [[ ! -f "$CANVAS_DIR/config/outgoing_mail.yml" ]]; then
         cat > "$CANVAS_DIR/config/outgoing_mail.yml" <<'EOF'
@@ -629,10 +635,10 @@ development:
 EOF
         log_ok "config/outgoing_mail.yml"
     else
-        log_ok "config/outgoing_mail.yml (already exists — not overwritten)"
+        log_ok "config/outgoing_mail.yml (already exists : not overwritten)"
     fi
 
-    # redis.yml — always write to guarantee correct format.
+    # redis.yml : always write to guarantee correct format.
     # Canvas changed 'servers:' to 'url:' in November 2023.
     cat > "$CANVAS_DIR/config/redis.yml" <<'EOF'
 development:
@@ -642,7 +648,7 @@ test:
 EOF
     log_ok "config/redis.yml"
 
-    # cache_store.yml — use memory_store during setup tasks.
+    # cache_store.yml : use memory_store during setup tasks.
     # Canvas loads this during Rails environment init, which runs even for
     # db:create. If redis_store is set, Canvas tries to connect to Redis
     # before the DB exists and crashes. memory_store avoids this.
@@ -665,7 +671,7 @@ EOF
     fi
 
     cat > "$CANVAS_DIR/docker-compose.override.yml" <<EOF
-# Generated by canvas-setup-macos.sh — do not commit this file.
+# Generated by canvas-setup-macos.sh : do not commit this file.
 # PLACEHOLDER credentials below are for local development only.
 services:
   web:
@@ -725,14 +731,14 @@ EOF
     cat > "$CANVAS_DIR/.env" << 'DOTENV'
 COMPOSE_FILE=docker-compose.yml:docker-compose.override.yml
 DOTENV
-    log_ok ".env (COMPOSE_FILE set — plain 'docker compose' commands now work)"
+    log_ok ".env (COMPOSE_FILE set : plain 'docker compose' commands now work)"
 
     GENERATED_ADMIN_EMAIL="$admin_email"
     GENERATED_ADMIN_PASS="$admin_pass"
 }
 
 # =============================================================================
-# STEP 5 — Pull base Docker images
+# STEP 5 : Pull base Docker images
 # =============================================================================
 pull_images() {
     log_step "Step 5: Pulling Docker base images"
@@ -773,7 +779,7 @@ pull_images() {
 }
 
 # =============================================================================
-# STEP 6 — Build, start, install assets, seed database
+# STEP 6 : Build, start, install assets, seed database
 # =============================================================================
 build_and_start() {
     cd "$CANVAS_DIR"
@@ -782,12 +788,12 @@ build_and_start() {
     log_step "Step 6: Building Docker images"
     if [[ "$ARCH" == "arm64" ]]; then
         log_info "Apple Silicon: building with --platform linux/amd64 (Rosetta 2)"
-        log_info "First run may take 20-45 min on Apple Silicon — this is normal."
+        log_info "First run may take 20-45 min on Apple Silicon : this is normal."
         DOCKER_DEFAULT_PLATFORM=linux/amd64 $dc build --pull \
-            || die "Docker build failed — check output above"
+            || die "Docker build failed : check output above"
     else
         log_info "First run takes 10-20 min."
-        $dc build --pull || die "Docker build failed — check output above"
+        $dc build --pull || die "Docker build failed : check output above"
     fi
     log_ok "Build complete"
 
@@ -832,7 +838,7 @@ build_and_start() {
     #   into the serving containers after run --rm exits.
     [[ "$ARCH" == "arm64" ]] && export DOCKER_DEFAULT_PLATFORM=linux/amd64
 
-    log_step "Step 9: Installing assets and seeding database  (slow — 20-45 min)"
+    log_step "Step 9: Installing assets and seeding database  (slow : 20-45 min)"
 
     $dc run --rm --no-deps --user root web bash -lc '
         set -e
@@ -863,7 +869,7 @@ build_and_start() {
 
         echo "--- Migrating test database ---"
         RAILS_ENV=test bundle exec rake db:migrate || true
-    ' || die "Setup failed — check output above"
+    ' || die "Setup failed : check output above"
     log_ok "Assets installed and database seeded"
 
     log_step "Step 10: Starting all Canvas services"
@@ -881,7 +887,7 @@ build_and_start() {
     if [[ "$passenger_ready" == true ]]; then
         log_ok "Passenger online"
     else
-        log_warn "Passenger signal not seen within 3 minutes — Canvas may still be loading"
+        log_warn "Passenger signal not seen within 3 minutes : Canvas may still be loading"
         log_warn "Check: $dc logs web"
     fi
 
@@ -901,7 +907,7 @@ build_and_start() {
 
 
 # =============================================================================
-# STEP A — macOS Application Firewall
+# STEP A : macOS Application Firewall
 #
 # macOS uses an application-based firewall, not a port-based one. Docker
 # Desktop registers itself as a trusted application, so its bound ports
@@ -914,28 +920,28 @@ build_and_start() {
 configure_firewall() {
     log_step "Step A: macOS Firewall"
     log_info "macOS uses an application-based firewall."
-    log_info "Docker Desktop is already trusted — no port rules are needed."
+    log_info "Docker Desktop is already trusted : no port rules are needed."
     log_info "Postgres/Redis are bound to 127.0.0.1 only and are not exposed."
     log_ok "Firewall: no action required"
 }
 
 # =============================================================================
-# STEP B — launchd LaunchAgent for persistent auto-start
+# STEP B : launchd LaunchAgent for persistent auto-start
 #
 # macOS uses launchd instead of systemd. A LaunchAgent in
 # ~/Library/LaunchAgents/ runs when the user logs in.
 #
 # Three-layer persistence on macOS:
 #
-#   Layer 1 — Docker Desktop "Start at Login" setting:
+#   Layer 1 : Docker Desktop "Start at Login" setting:
 #     Enable in Docker Desktop → Settings → General → Start Docker Desktop
 #     when you log in. Without this, layers 2 and 3 cannot start containers.
 #
-#   Layer 2 — restart: unless-stopped in docker-compose.override.yml:
+#   Layer 2 : restart: unless-stopped in docker-compose.override.yml:
 #     When Docker Desktop starts, it automatically restarts containers that
 #     were running before the last shutdown (crash recovery).
 #
-#   Layer 3 — com.privacysafe.canvas-lms LaunchAgent (this step):
+#   Layer 3 : com.privacysafe.canvas-lms LaunchAgent (this step):
 #     A launchd agent that runs docker compose up -d after login. Provides
 #     a clean management interface and a backup start mechanism.
 #
@@ -954,10 +960,10 @@ configure_launchd() {
 
     mkdir -p "$plist_dir"
 
-    # Wrapper script — waits for Docker Desktop then starts Canvas
+    # Wrapper script : waits for Docker Desktop then starts Canvas
     cat > "$wrapper_path" << EOF
 #!/bin/bash
-# canvas-lms-start.sh — LaunchAgent helper
+# canvas-lms-start.sh : LaunchAgent helper
 # Waits for Docker Desktop to be ready, then starts Canvas LMS.
 
 # Wait up to 2.5 minutes for Docker Desktop (it may take time to start at login)

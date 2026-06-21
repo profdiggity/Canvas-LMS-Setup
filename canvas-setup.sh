@@ -1,18 +1,24 @@
 #!/usr/bin/env bash
 # SPDX-FileCopyrightText: 2026 PrivacySafe Foundation, Inc.
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: AGPL-3.0-or-later
 #
-# canvas-setup.sh — Canvas LMS local development installer for Ubuntu 24.04
+# canvas-setup.sh: Canvas LMS local development installer for Ubuntu 24.04
 #
-# Part of the Canvas LMS Setup Toolkit by PrivacySafe Foundation Inc.
-# MIT License — see LICENSE file or https://opensource.org/licenses/MIT
+# Part of the Canvas LMS Setup Toolkit by PrivacySafe Foundation, Inc.
+# This file is free software licensed under the GNU Affero General Public
+# License v3.0 or later. See LICENSE.
 #
-# Canvas LMS is open-source software developed by Instructure, Inc. and
-# licensed under the GNU Affero General Public License v3.0 (AGPL-3.0).
+# Canvas LMS is free software developed by Instructure, Inc. and licensed
+# under the GNU Affero General Public License v3.0 (AGPL-3.0).
 # Source: https://github.com/instructure/canvas-lms
 #
 # Inspired by original work by swzhang
 # https://github.com/swzhangf/Canvas-LMS-Setup
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+# FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for more
+# details.
 #
 # =============================================================================
 # Usage:
@@ -42,7 +48,7 @@
 set -euo pipefail
 
 # -----------------------------------------------------------------------------
-# Configuration — edit these defaults or override via flags
+# Configuration : edit these defaults or override via flags
 # -----------------------------------------------------------------------------
 INSTALL_PATH=""
 USE_MIRROR=false
@@ -54,15 +60,15 @@ DOCKER_MIRROR="docker.1ms.run"
 
 # Canvas base images (pinned to what Canvas's Dockerfile expects)
 RUBY_IMAGE="instructure/ruby-passenger:2.7"
-# Detected dynamically after clone — see detect_postgres_image()
+# Detected dynamically after clone : see detect_postgres_image()
 POSTGIS_IMAGE="postgis/postgis:12-2.5"  # fallback only
 REDIS_IMAGE="redis:alpine"
 
-# Populated later — the real user even when run with sudo
+# Populated later : the real user even when run with sudo
 REAL_USER=""
 REAL_HOME=""
 
-# Docker command — may become "sudo docker" if user isn't in the docker group
+# Docker command : may become "sudo docker" if user isn't in the docker group
 DOCKER_CMD="docker"
 
 # -----------------------------------------------------------------------------
@@ -96,7 +102,7 @@ resolve_real_user() {
         REAL_USER="$SUDO_USER"
         REAL_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
     elif [[ "$EUID" -eq 0 ]]; then
-        # Genuinely running as root (not via sudo) — use root's home
+        # Genuinely running as root (not via sudo) : use root's home
         REAL_USER="root"
         REAL_HOME="/root"
         log_warn "Running as root directly. Files in $INSTALL_PATH will be owned by root."
@@ -149,7 +155,7 @@ done
 
 [[ -z "$INSTALL_PATH" ]] && die "--install-path is required"
 [[ "$PORT" =~ ^[0-9]+$ ]] || die "--port must be a number (got: $PORT)"
-[[ "$PORT" -ge 1 && "$PORT" -le 65535 ]] || die "--port must be 1–65535"
+[[ "$PORT" -ge 1 && "$PORT" -le 65535 ]] || die "--port must be 1-65535"
 
 resolve_real_user
 
@@ -157,7 +163,7 @@ CANVAS_DIR="$INSTALL_PATH"
 
 printf "\n%s" "${BOLD}"
 echo "====================================================="
-echo "  Canvas LMS — Local Development Setup"
+echo "  Canvas LMS : Local Development Setup"
 echo "  Target:  $CANVAS_DIR"
 echo "  Port:    $PORT"
 echo "  Mirror:  $USE_MIRROR"
@@ -166,7 +172,7 @@ echo "====================================================="
 printf "%s\n" "${NC}"
 
 # =============================================================================
-# STEP 1 — Install prerequisites
+# STEP 1 : Install prerequisites
 # =============================================================================
 install_prerequisites() {
     log_step "Step 1: Checking and installing prerequisites"
@@ -175,7 +181,7 @@ install_prerequisites() {
     if grep -q 'VERSION_ID="24.04"' /etc/os-release 2>/dev/null; then
         log_ok "Ubuntu 24.04 detected"
     else
-        log_warn "Ubuntu 24.04 not confirmed — continuing, but results may vary"
+        log_warn "Ubuntu 24.04 not confirmed : continuing, but results may vary"
     fi
 
     # Memory check
@@ -183,20 +189,20 @@ install_prerequisites() {
         local mem_gb
         mem_gb=$(free -g | awk '/^Mem:/{print $2}')
         if [[ "${mem_gb:-0}" -lt 8 ]]; then
-            log_warn "Only ${mem_gb} GB RAM — 8 GB+ recommended. Builds may be slow or OOM."
+            log_warn "Only ${mem_gb} GB RAM : 8 GB+ recommended. Builds may be slow or OOM."
         else
             log_ok "RAM: ${mem_gb} GB"
         fi
     fi
 
-    # Disk check — check the target install path's filesystem
+    # Disk check : check the target install path's filesystem
     local check_path="$INSTALL_PATH"
     [[ -d "$check_path" ]] || check_path="$(dirname "$check_path")"
     [[ -d "$check_path" ]] || check_path="/"
     local free_gb
     free_gb=$(df -BG --output=avail "$check_path" | tail -1 | tr -d 'G ')
     if [[ "${free_gb:-0}" -lt 20 ]]; then
-        log_warn "Only ${free_gb} GB free — Canvas build needs ~20 GB"
+        log_warn "Only ${free_gb} GB free : Canvas build needs ~20 GB"
     else
         log_ok "Free disk: ${free_gb} GB"
     fi
@@ -219,7 +225,7 @@ install_prerequisites() {
     log_ok "Python3: $(python3 --version)"
 
     # ------------------------------------------------------------------
-    # Docker CE — use Docker's official APT repo, not Ubuntu GNU/Linux's docker.io.
+    # Docker CE : use Docker's official APT repo, not Ubuntu GNU/Linux's docker.io.
     # docker.io is stale and lacks docker-buildx-plugin / docker-compose-plugin.
     # ------------------------------------------------------------------
     local docker_ok=false
@@ -233,11 +239,11 @@ install_prerequisites() {
     if [[ "$docker_ok" == false ]] && sudo docker compose version &>/dev/null 2>&1; then
         docker_ok=true
         DOCKER_CMD="sudo docker"
-        log_info "Docker found via sudo — will use 'sudo docker' for this session"
+        log_info "Docker found via sudo : will use 'sudo docker' for this session"
     fi
 
     if [[ "$docker_ok" == false ]]; then
-        log_info "Docker CE not found — installing from Docker's official APT repo"
+        log_info "Docker CE not found : installing from Docker's official APT repo"
 
         # Strip any conflicting Ubuntu GNU/Linux-packaged docker variants
         for pkg in docker.io docker-doc docker-compose docker-compose-v2 \
@@ -251,7 +257,7 @@ install_prerequisites() {
         _sudo apt-get update -qq
         _sudo apt-get install -y ca-certificates curl gnupg lsb-release
 
-        # Docker's official GPG key — modern /etc/apt/keyrings method
+        # Docker's official GPG key : modern /etc/apt/keyrings method
         _sudo install -m 0755 -d /etc/apt/keyrings
         _sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
             -o /etc/apt/keyrings/docker.asc
@@ -293,7 +299,7 @@ $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
     else
         log_info "Adding '$REAL_USER' to the docker group..."
         _sudo usermod -aG docker "$REAL_USER"
-        # Use sudo docker for the rest of this run — no logout needed
+        # Use sudo docker for the rest of this run : no logout needed
         DOCKER_CMD="sudo docker"
         log_warn "Added '$REAL_USER' to the docker group."
         log_warn "For future sessions, log out and back in to use docker without sudo."
@@ -363,13 +369,13 @@ RESOLVER
 }
 
 # =============================================================================
-# STEP 2 — Clone Canvas LMS
+# STEP 2 : Clone Canvas LMS
 # =============================================================================
 clone_canvas() {
     log_step "Step 2: Cloning Canvas LMS"
 
     if [[ -d "$CANVAS_DIR/.git" ]]; then
-        log_warn "Repository already exists at $CANVAS_DIR — skipping clone"
+        log_warn "Repository already exists at $CANVAS_DIR : skipping clone"
         return 0
     fi
 
@@ -404,13 +410,13 @@ clone_canvas() {
 
 
 # =============================================================================
-# STEP 2b — Detect the correct postgres image from Canvas's own Dockerfile
+# STEP 2b : Detect the correct postgres image from Canvas's own Dockerfile
 # =============================================================================
 detect_postgres_image() {
     local pg_df="$CANVAS_DIR/docker-compose/postgres/Dockerfile"
 
     if [[ ! -f "$pg_df" ]]; then
-        log_warn "postgres Dockerfile not found — defaulting to postgis:14-3.3"
+        log_warn "postgres Dockerfile not found : defaulting to postgis:14-3.3"
         POSTGIS_IMAGE="postgis/postgis:14-3.3"
         return 0
     fi
@@ -425,14 +431,14 @@ detect_postgres_image() {
         log_info "Canvas postgres image resolved: $resolved"
         POSTGIS_IMAGE="$resolved"
     else
-        log_warn "Could not resolve postgres image from Dockerfile — using postgis:14-3.3"
+        log_warn "Could not resolve postgres image from Dockerfile : using postgis:14-3.3"
         POSTGIS_IMAGE="postgis/postgis:14-3.3"
     fi
     log_ok "Postgres image: $POSTGIS_IMAGE"
 }
 
 # =============================================================================
-# STEP 3 — Patch Dockerfiles
+# STEP 3 : Patch Dockerfiles
 #
 # WHY these patches are needed on Ubuntu 24.04:
 #
@@ -507,7 +513,7 @@ INNERPY
 configure_canvas() {
     log_step "Step 4: Writing Canvas config files"
 
-    # Copy Canvas's bundled example configs first — they contain correct
+    # Copy Canvas's bundled example configs first : they contain correct
     # boilerplate for all services. We then overwrite only what we need.
     local example_dir="$CANVAS_DIR/docker-compose/config"
     if [[ -d "$example_dir" ]]; then
@@ -515,26 +521,26 @@ configure_canvas() {
         cp "$example_dir"/*.yml "$CANVAS_DIR/config/" 2>/dev/null || true
         log_ok "Example configs copied"
     else
-        log_warn "docker-compose/config/ not found — writing configs from scratch"
+        log_warn "docker-compose/config/ not found : writing configs from scratch"
     fi
 
     mkdir -p "$CANVAS_DIR/config"
 
-    # Random 64-hex-char encryption key — unique per installation, never stored
+    # Random 64-hex-char encryption key : unique per installation, never stored
     # in source control. PLACEHOLDER: any 20+ char string works for dev.
     local enc_key
     # tr reads from /dev/urandom (infinite); head closes the pipe after 64 chars,
     # causing SIGPIPE (exit 141). The || true suppresses that under set -euo pipefail.
     enc_key="$(tr -dc 'a-f0-9' < /dev/urandom | head -c 64 || true)"
 
-    # PLACEHOLDER DB password — local only, matches the postgres service.
+    # PLACEHOLDER DB password : local only, matches the postgres service.
     # Change this if you ever expose port 5432 outside localhost.
     # PLACEHOLDER: must match Canvas postgres image init script which creates
     # the canvas role with this password. Do not change without also rebuilding
     # the postgres image with a matching password.
     local db_pass="sekret"
 
-    # PLACEHOLDER admin credentials — first-run seed values only.
+    # PLACEHOLDER admin credentials : first-run seed values only.
     # Canvas will use these to create the initial admin account.
     local admin_email="admin@canvas.local"
     local admin_pass="ChangeMe_AfterSetup_1!"
@@ -600,7 +606,7 @@ test:
 EOF
     log_ok "config/security.yml"
 
-    # dynamic_settings.yml — Canvas uses this for optional services (RCE, LTI tools,
+    # dynamic_settings.yml : Canvas uses this for optional services (RCE, LTI tools,
     # Consul, etc.). Canvas ships an example at docker-compose/config/dynamic_settings.yml
     # which our cp step above already copies. We write our own only if it wasn't copied,
     # to ensure the file always exists with at least the canvas_security keys needed for
@@ -612,7 +618,7 @@ EOF
         lti_enc_secret="$(tr -dc 'a-z0-9' < /dev/urandom | head -c 32 || true)"
         lti_sign_secret="$(tr -dc 'a-z0-9' < /dev/urandom | head -c 32 || true)"
         cat > "$CANVAS_DIR/config/dynamic_settings.yml" <<EOF
-# Generated by canvas-setup.sh — safe to commit (no real secrets here for local dev)
+# Generated by canvas-setup.sh : safe to commit (no real secrets here for local dev)
 development:
   config:
     canvas:
@@ -629,7 +635,7 @@ EOF
         log_ok "config/dynamic_settings.yml (copied from Canvas example)"
     fi
 
-    # outgoing_mail.yml — required for Canvas to boot without errors.
+    # outgoing_mail.yml : required for Canvas to boot without errors.
     # PLACEHOLDER: localhost:25 is a no-op; no mail is actually delivered.
     if [[ ! -f "$CANVAS_DIR/config/outgoing_mail.yml" ]]; then
         cat > "$CANVAS_DIR/config/outgoing_mail.yml" <<'EOF'
@@ -643,10 +649,10 @@ development:
 EOF
         log_ok "config/outgoing_mail.yml"
     else
-        log_ok "config/outgoing_mail.yml (already exists — not overwritten)"
+        log_ok "config/outgoing_mail.yml (already exists : not overwritten)"
     fi
 
-    # redis.yml — always write this to guarantee correct format.
+    # redis.yml : always write this to guarantee correct format.
     # Canvas changed 'servers:' to 'url:' in Nov 2023. We overwrite any copied
     # example to ensure we always have the right key regardless of Canvas version.
     cat > "$CANVAS_DIR/config/redis.yml" <<'EOF'
@@ -661,7 +667,7 @@ EOF
     # MUST use memory_store here, not redis_store. Canvas loads cache_store.yml
     # during Rails environment init which happens even for db:create. If redis_store
     # is set, Canvas tries to connect to Redis before the DB exists and crashes.
-    # After `docker compose up -d` the app runs fine with redis_store — but for
+    # After `docker compose up -d` the app runs fine with redis_store : but for
     # the setup rake tasks, memory_store is required to avoid the chicken-and-egg.
     cat > "$CANVAS_DIR/config/cache_store.yml" <<'EOF'
 development:
@@ -674,7 +680,7 @@ EOF
     # docker-compose.override.yml
     # PLACEHOLDER credentials below are local dev only.
     cat > "$CANVAS_DIR/docker-compose.override.yml" <<EOF
-# Generated by canvas-setup.sh — do not commit this file.
+# Generated by canvas-setup.sh : do not commit this file.
 # PLACEHOLDER credentials below are for local development only.
 services:
   web:
@@ -732,7 +738,7 @@ EOF
     cat > "$CANVAS_DIR/.env" << 'DOTENV'
 COMPOSE_FILE=docker-compose.yml:docker-compose.override.yml
 DOTENV
-    log_ok ".env (COMPOSE_FILE set — plain 'docker compose' commands now work)"
+    log_ok ".env (COMPOSE_FILE set : plain 'docker compose' commands now work)"
 
     # Expose to the final summary
     GENERATED_ADMIN_EMAIL="$admin_email"
@@ -740,7 +746,7 @@ DOTENV
 }
 
 # =============================================================================
-# STEP 5 — Pull base Docker images
+# STEP 5 : Pull base Docker images
 # =============================================================================
 pull_images() {
     log_step "Step 5: Pulling Docker base images"
@@ -776,7 +782,7 @@ pull_images() {
 }
 
 # =============================================================================
-# STEP 6 — Build images, start services, install assets, seed database
+# STEP 6 : Build images, start services, install assets, seed database
 #
 # Follows the official Canvas Docker dev setup sequence from:
 #   doc/docker/developing_with_docker.md
@@ -912,7 +918,7 @@ build_and_start() {
         if curl -fsS --connect-timeout 5 -o /dev/null                 "http://localhost:${PORT}/login" 2>/dev/null; then
             log_ok "Canvas is live at http://localhost:${PORT}"
         else
-            log_warn "/login returned an error — Passenger may still be booting Canvas."
+            log_warn "/login returned an error : Passenger may still be booting Canvas."
             log_warn "Wait 30 seconds then try http://localhost:${PORT} in your browser."
             log_warn "If it still fails: $dc logs --tail 50 web"
         fi
@@ -921,7 +927,7 @@ build_and_start() {
 
 
 # =============================================================================
-# STEP A — Configure UFW firewall
+# STEP A : Configure UFW firewall
 #
 # Docker bypasses UFW by directly manipulating iptables. This means Canvas's
 # web port is reachable from the network even if UFW has no explicit rule.
@@ -929,13 +935,13 @@ build_and_start() {
 # auditable, and so tools that inspect UFW rules see Canvas listed.
 #
 # Postgres (5432) and Redis (6379) are bound to 127.0.0.1 only in our
-# override — they are never exposed externally regardless of UFW.
+# override : they are never exposed externally regardless of UFW.
 # =============================================================================
 configure_firewall() {
     log_step "Step A: Firewall (UFW)"
 
     if ! command -v ufw &>/dev/null; then
-        log_info "UFW not installed — no firewall configuration needed"
+        log_info "UFW not installed : no firewall configuration needed"
         return 0
     fi
 
@@ -943,36 +949,36 @@ configure_firewall() {
     ufw_status=$(_sudo ufw status 2>/dev/null | head -1 || true)
 
     if echo "$ufw_status" | grep -q "inactive"; then
-        log_info "UFW is installed but inactive — no rules needed"
+        log_info "UFW is installed but inactive : no rules needed"
         return 0
     fi
 
-    # UFW is active — add explicit allow rule for the Canvas web port
-    log_info "UFW is active — adding allow rule for port ${PORT}/tcp"
+    # UFW is active : add explicit allow rule for the Canvas web port
+    log_info "UFW is active : adding allow rule for port ${PORT}/tcp"
     _sudo ufw allow "${PORT}/tcp" comment "Canvas LMS web" 2>/dev/null \
-        || log_warn "Could not add UFW rule — you may need to run: sudo ufw allow ${PORT}/tcp"
+        || log_warn "Could not add UFW rule : you may need to run: sudo ufw allow ${PORT}/tcp"
 
     log_ok "UFW: port ${PORT}/tcp allowed"
     log_info "Note: Docker bypasses UFW via iptables, so Canvas is already reachable."
     log_info "      The rule above makes the allowance explicit and auditable."
-    log_info "      Postgres/Redis are bound to 127.0.0.1 — never exposed externally."
+    log_info "      Postgres/Redis are bound to 127.0.0.1 : never exposed externally."
 }
 
 # =============================================================================
-# STEP B — Create and enable a systemd service for Canvas LMS
+# STEP B : Create and enable a systemd service for Canvas LMS
 #
 # Three-layer persistence on reboot:
 #
-#   Layer 1 — docker.service enabled:
+#   Layer 1 : docker.service enabled:
 #     Docker daemon starts automatically on every boot.
 #     (Done in Step 1 via: systemctl enable docker)
 #
-#   Layer 2 — restart: unless-stopped in docker-compose.override.yml:
+#   Layer 2 : restart: unless-stopped in docker-compose.override.yml:
 #     If Docker restarts or the machine crashes, Docker automatically
 #     restarts any container that was running (not explicitly stopped).
 #     This covers unexpected reboots where systemd doesn't cleanly stop things.
 #
-#   Layer 3 — canvas-lms.service (this step):
+#   Layer 3 : canvas-lms.service (this step):
 #     A proper systemd unit that starts Canvas after Docker and the network
 #     are fully ready. Provides clean systemctl management:
 #       sudo systemctl start   canvas-lms
@@ -994,7 +1000,7 @@ create_systemd_service() {
     local service_path="/etc/systemd/system/canvas-lms.service"
 
     _sudo tee "$service_path" > /dev/null << EOF
-# canvas-lms.service — managed by canvas-setup.sh
+# canvas-lms.service : managed by canvas-setup.sh
 # Canvas LMS install: ${CANVAS_DIR}
 [Unit]
 Description=Canvas LMS (Docker Compose)
@@ -1008,7 +1014,7 @@ Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=${CANVAS_DIR}
 
-# Start: bring all Canvas containers up (idempotent — safe if already running)
+# Start: bring all Canvas containers up (idempotent : safe if already running)
 ExecStart=${docker_bin} compose \\
     -f docker-compose.yml \\
     -f docker-compose.override.yml \\
@@ -1030,7 +1036,7 @@ ExecReload=${docker_bin} compose \\
 StandardOutput=journal
 StandardError=journal
 
-# Canvas startup includes Rails boot + asset loading — allow plenty of time
+# Canvas startup includes Rails boot + asset loading : allow plenty of time
 TimeoutStartSec=300
 TimeoutStopSec=90
 
@@ -1043,12 +1049,12 @@ EOF
         || die "Failed to enable canvas-lms.service"
 
     log_ok "Service file: $service_path"
-    log_ok "canvas-lms.service enabled — Canvas will start automatically on every boot"
+    log_ok "canvas-lms.service enabled : Canvas will start automatically on every boot"
 }
 
 
 # =============================================================================
-# STEP C — Boot splash screen on tty1
+# STEP C : Boot splash screen on tty1
 #
 # Displays a Canvas LMS welcome screen on the virtual console after every boot,
 # once Canvas is confirmed reachable over HTTP. Styled after common appliance
@@ -1064,7 +1070,7 @@ create_splash_service() {
     # --- The splash script ----------------------------------------------------
     _sudo tee "$splash_script" > /dev/null << SPLASHEOF
 #!/usr/bin/env bash
-# canvas-lms-splash — displayed on tty1 after Canvas is reachable
+# canvas-lms-splash : displayed on tty1 after Canvas is reachable
 PORT="${PORT}"
 CANVAS_DIR="${CANVAS_DIR}"
 
@@ -1084,7 +1090,7 @@ HOST_IP="\${HOST_IP:-localhost}"
 
 STATUS="running"
 curl -s --connect-timeout 3 -o /dev/null "http://localhost:\$PORT" 2>/dev/null \
-    || STATUS="not yet reachable — check: sudo systemctl status canvas-lms"
+    || STATUS="not yet reachable : check: sudo systemctl status canvas-lms"
 
 clear
 cat << BANNER
@@ -1180,7 +1186,7 @@ SVCEOF
 
     _sudo systemctl daemon-reload
     _sudo systemctl enable canvas-lms-splash
-    log_ok "canvas-lms-splash.service enabled — will display on tty1 after each boot"
+    log_ok "canvas-lms-splash.service enabled : will display on tty1 after each boot"
 }
 
 # =============================================================================

@@ -1,17 +1,23 @@
 # SPDX-FileCopyrightText: 2026 PrivacySafe Foundation, Inc.
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: AGPL-3.0-or-later
 #
-# canvas-setup-windows.ps1 — Canvas LMS local development installer for Windows
+# canvas-setup-windows.ps1: Canvas LMS local development installer for Windows
 #
 # Part of the Canvas LMS Setup Toolkit by PrivacySafe Foundation, Inc.
-# MIT License — see LICENSE file or https://opensource.org/licenses/MIT
+# This file is free software licensed under the GNU Affero General Public
+# License v3.0 or later. See LICENSE.
 #
-# Canvas LMS is open-source software developed by Instructure, Inc. and
-# licensed under the GNU Affero General Public License v3.0 (AGPL-3.0).
+# Canvas LMS is free software developed by Instructure, Inc. and licensed
+# under the GNU Affero General Public License v3.0 (AGPL-3.0).
 # Source: https://github.com/instructure/canvas-lms
 #
 # Inspired by original work by swzhang
 # https://github.com/swzhangf/Canvas-LMS-Setup
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+# FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for more
+# details.
 
 <#
 .SYNOPSIS
@@ -60,8 +66,8 @@
       config/security.yml (generated encryption key) must never be committed.
 
     COPYRIGHT / LICENSE:
-      This script is copyright 2026 PrivacySafe Foundation, Inc., MIT License.
-      Canvas LMS is copyright Instructure, Inc., AGPL-3.0 License.
+      This script is copyright 2026 PrivacySafe Foundation, Inc. and is licensed under AGPL-3.0-or-later.
+      Canvas LMS is copyright Instructure, Inc. and is licensed under AGPL-3.0.
 #>
 
 param(
@@ -113,7 +119,7 @@ function Invoke-Compose {
 }
 
 # Write a UTF-8 file with Unix (LF) line endings.
-# Config files are read inside Linux containers — CRLF causes parse errors.
+# Config files are read inside Linux containers : CRLF causes parse errors.
 function Write-UnixFile {
     param([string]$Path, [string]$Content)
     $utf8NoBom  = New-Object System.Text.UTF8Encoding $false
@@ -167,18 +173,18 @@ function Install-Prerequisites {
         if ($disk) {
             $freeGB = [math]::Floor($disk.Free / 1GB)
             if ($freeGB -lt 25) {
-                Write-Warn "Only ${freeGB} GB free on $drive — Canvas build needs ~25 GB"
+                Write-Warn "Only ${freeGB} GB free on $drive : Canvas build needs ~25 GB"
             } else {
                 Write-Ok "Free disk: ${freeGB} GB"
             }
         }
-    } catch { Write-Warn "Could not check disk space — ensure you have 25 GB+ free" }
+    } catch { Write-Warn "Could not check disk space : ensure you have 25 GB+ free" }
 
     # -----------------------------------------------------------------------
     # Git
     # -----------------------------------------------------------------------
     if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
-        Write-Info "Git not found — attempting to install via winget..."
+        Write-Info "Git not found : attempting to install via winget..."
         if (Get-Command winget -ErrorAction SilentlyContinue) {
             winget install --id Git.Git -e --source winget --silent 2>&1 | Out-Null
             # Refresh PATH so git is found in this session
@@ -210,7 +216,7 @@ function Install-Prerequisites {
     } catch { }
 
     if (-not $dockerRunning) {
-        Write-Info "Docker Desktop is not running — attempting to start it..."
+        Write-Info "Docker Desktop is not running : attempting to start it..."
         $dockerExe = "${env:ProgramFiles}\Docker\Docker\Docker Desktop.exe"
         if (Test-Path $dockerExe) {
             Start-Process $dockerExe
@@ -254,7 +260,7 @@ function Copy-CanvasSource {
     Write-Step "Step 2: Cloning Canvas LMS"
 
     if (Test-Path (Join-Path $CANVAS_DIR ".git")) {
-        Write-Warn "Repository already exists at $CANVAS_DIR — skipping clone"
+        Write-Warn "Repository already exists at $CANVAS_DIR : skipping clone"
         return
     }
 
@@ -284,7 +290,7 @@ function Get-PostgresImage {
     $fallback = "postgis/postgis:14-3.3"
 
     if (-not (Test-Path $pgDf)) {
-        Write-Warn "postgres Dockerfile not found — defaulting to postgis:14-3.3"
+        Write-Warn "postgres Dockerfile not found : defaulting to postgis:14-3.3"
         return $fallback
     }
 
@@ -318,7 +324,7 @@ function Get-PostgresImage {
     # Extract FROM line
     $fromMatch = [regex]::Match($dfText, '(?m)^FROM\s+(\S+)')
     if (-not $fromMatch.Success) {
-        Write-Warn "Could not read FROM line — defaulting to postgis:14-3.3"
+        Write-Warn "Could not read FROM line : defaulting to postgis:14-3.3"
         return $fallback
     }
 
@@ -335,7 +341,7 @@ function Get-PostgresImage {
         return $resolved.Trim()
     }
 
-    Write-Warn "Could not resolve postgres image from Dockerfile — defaulting to postgis:14-3.3"
+    Write-Warn "Could not resolve postgres image from Dockerfile : defaulting to postgis:14-3.3"
     return $fallback
 }
 
@@ -365,7 +371,7 @@ function Update-Dockerfiles {
                                 'echo "deb [trusted=yes] http://apt.postgresql.org'
         $text = $text -replace 'apt-key add - && apt-get update -qq && apt-get install',
                                 'apt-key add - 2>/dev/null || true && (apt-get update -qq || true) && apt-get install'
-        # Remove keyserver fetches — they time out or fail in modern environments
+        # Remove keyserver fetches : they time out or fail in modern environments
         $text = [regex]::Replace($text,
             'apt-key adv --keyserver\s+\S+\s+--recv-keys\s+\S+[^\n]*\n',
             "# apt-key adv removed -- [trusted=yes] used instead`n")
@@ -377,7 +383,7 @@ function Update-Dockerfiles {
             Write-Ok "Main Dockerfile already up to date"
         }
     } else {
-        Write-Warn "Main Dockerfile not found — skipping"
+        Write-Warn "Main Dockerfile not found : skipping"
     }
 
     # --- PostGIS Dockerfile ---------------------------------------------------
@@ -418,14 +424,14 @@ RUN set -eux; \
             Write-Ok "PostGIS Dockerfile patched"
         }
     } else {
-        Write-Warn "PostGIS Dockerfile not found — skipping"
+        Write-Warn "PostGIS Dockerfile not found : skipping"
     }
 }
 
 # =============================================================================
 # STEP 4 - Write Canvas config files
 #
-# PLACEHOLDER CREDENTIALS — local dev only.
+# PLACEHOLDER CREDENTIALS : local dev only.
 # DO NOT expose to the internet without changing these values.
 # config/*.yml is in Canvas's .gitignore and will not be committed.
 # =============================================================================
@@ -435,7 +441,7 @@ function Set-CanvasConfig {
     $configDir   = Join-Path $CANVAS_DIR "config"
     $exampleDir  = Join-Path $CANVAS_DIR "docker-compose\config"
 
-    # Copy Canvas's bundled example configs first — they have correct boilerplate.
+    # Copy Canvas's bundled example configs first : they have correct boilerplate.
     # We then overwrite only what we need to customise.
     if (Test-Path $exampleDir) {
         Write-Info "Copying example configs from docker-compose/config/"
@@ -444,7 +450,7 @@ function Set-CanvasConfig {
         }
         Write-Ok "Example configs copied"
     } else {
-        Write-Warn "docker-compose/config/ not found — writing configs from scratch"
+        Write-Warn "docker-compose/config/ not found : writing configs from scratch"
     }
 
     if (-not (Test-Path $configDir)) {
@@ -458,9 +464,9 @@ function Set-CanvasConfig {
     $rng.GetBytes($bytes)
     $encKey = ($bytes | ForEach-Object { '{0:x2}' -f $_ }) -join ''
 
-    # PLACEHOLDER DB password — matches Canvas's postgres image init script.
+    # PLACEHOLDER DB password : matches Canvas's postgres image init script.
     $dbPass    = "sekret"
-    # PLACEHOLDER admin credentials — used for first-run seeding only.
+    # PLACEHOLDER admin credentials : used for first-run seeding only.
     $adminEmail = "admin@canvas.local"
     $adminPass  = "ChangeMe_AfterSetup_1!"
 
@@ -519,7 +525,7 @@ test:
 "@
     Write-Ok "config/security.yml"
 
-    # dynamic_settings.yml — Canvas uses this for optional services (RCE, LTI tools,
+    # dynamic_settings.yml : Canvas uses this for optional services (RCE, LTI tools,
     # Consul, etc.). Canvas ships an example at docker-compose/config/dynamic_settings.yml
     # which our copy step already brings over. We write our own only if it wasn't copied,
     # to ensure the file always exists with the canvas_security keys needed for LTI
@@ -529,7 +535,7 @@ test:
         $ltiEncSecret = -join ((48..57) + (97..122) | Get-Random -Count 32 | ForEach-Object { [char]$_ })
         $ltiSignSecret = -join ((48..57) + (97..122) | Get-Random -Count 32 | ForEach-Object { [char]$_ })
         Write-UnixFile $dynSettingsFile @"
-# Generated by canvas-setup-windows.ps1 — safe to commit (no real secrets for local dev)
+# Generated by canvas-setup-windows.ps1 : safe to commit (no real secrets for local dev)
 development:
   config:
     canvas:
@@ -544,7 +550,7 @@ development:
         Write-Ok "config/dynamic_settings.yml (copied from Canvas example)"
     }
 
-    # outgoing_mail.yml — Canvas requires this file to boot without errors.
+    # outgoing_mail.yml : Canvas requires this file to boot without errors.
     # PLACEHOLDER: localhost:25 is a no-op; no mail is actually delivered.
     $mailFile = Join-Path $configDir "outgoing_mail.yml"
     if (-not (Test-Path $mailFile)) {
@@ -559,10 +565,10 @@ development:
 '@
         Write-Ok "config/outgoing_mail.yml"
     } else {
-        Write-Ok "config/outgoing_mail.yml (already exists — not overwritten)"
+        Write-Ok "config/outgoing_mail.yml (already exists : not overwritten)"
     }
 
-    # redis.yml — always write to guarantee correct format.
+    # redis.yml : always write to guarantee correct format.
     # Canvas changed 'servers:' to 'url:' in November 2023.
     Write-UnixFile (Join-Path $configDir "redis.yml") @'
 development:
@@ -572,7 +578,7 @@ test:
 '@
     Write-Ok "config/redis.yml"
 
-    # cache_store.yml — use memory_store during setup rake tasks.
+    # cache_store.yml : use memory_store during setup rake tasks.
     # Canvas loads this during Rails environment init, which happens even for
     # db:create. redis_store causes a connection crash before the DB exists.
     Write-UnixFile (Join-Path $configDir "cache_store.yml") @'
@@ -583,7 +589,7 @@ test:
 '@
     Write-Ok "config/cache_store.yml"
 
-    # docker-compose.override.yml — port mapping, env vars, volume mounts.
+    # docker-compose.override.yml : port mapping, env vars, volume mounts.
     # PLACEHOLDER credentials below are local dev only.
     Write-UnixFile (Join-Path $CANVAS_DIR "docker-compose.override.yml") @"
 # Generated by canvas-setup-windows.ps1 -- do not commit this file.
@@ -689,7 +695,7 @@ function Start-Canvas {
         # --- Build ------------------------------------------------------------
         Write-Step "Step 6: Building Docker images  (first run: 15-30 min)"
         Invoke-Compose build
-        if ($LASTEXITCODE -ne 0) { Write-Fail "Docker build failed — check output above" }
+        if ($LASTEXITCODE -ne 0) { Write-Fail "Docker build failed : check output above" }
         Write-Ok "Build complete"
 
         # --- Start postgres and redis FIRST -----------------------------------
@@ -715,7 +721,7 @@ function Start-Canvas {
 
         # Canvas's postgres image should create the canvas role via init scripts,
         # but those scripts are unreliable across versions. We create/update the
-        # role ourselves — idempotent and safe to run either way.
+        # role ourselves : idempotent and safe to run either way.
         Start-Sleep 5
         Write-Info "Ensuring canvas database role exists..."
         Invoke-Compose exec -T postgres psql -U postgres -c @"
@@ -736,10 +742,10 @@ END `$`$;
         # The serving web container starts fresh via up -d with no prior state.
         # bundler-multilock is reinstalled per-container since it lives in the
         # container home dir and does not persist across container exits.
-        # All setup steps in one container — gems from install_assets.sh
+        # All setup steps in one container : gems from install_assets.sh
         # (including git-sourced gems like authlogic) remain available for
         # rake tasks. Separate run --rm calls destroy the gem cache on exit.
-        Write-Step "Step 8: Installing assets and seeding database  (slow — 15-30 min)"
+        Write-Step "Step 8: Installing assets and seeding database  (slow : 15-30 min)"
         Invoke-Compose run --rm --no-deps web bash -c (
             "set -e; " +
             "echo '--- Installing bundler-multilock plugin ---'; " +
@@ -751,12 +757,12 @@ END `$`$;
             "echo '--- Migrating test database ---'; " +
             "RAILS_ENV=test bundle exec rake db:migrate || true"
         )
-        if ($LASTEXITCODE -ne 0) { Write-Fail "Setup failed — check output above" }
+        if ($LASTEXITCODE -ne 0) { Write-Fail "Setup failed : check output above" }
         Write-Ok "Assets installed and database seeded"
 
         # --- Start all services -----------------------------------------------
         # The web container starts here for the FIRST time as a serving
-        # container — no stale PID files, no old unix sockets, nothing.
+        # container : no stale PID files, no old unix sockets, nothing.
         Write-Step "Step 10: Starting all Canvas services"
         Invoke-Compose up -d
         if ($LASTEXITCODE -ne 0) { Write-Fail "Failed to start Canvas services" }
@@ -824,7 +830,7 @@ END `$`$;
 # Firewall may block inbound connections on the Canvas port from the network.
 # We add an explicit inbound allow rule for the web port.
 #
-# Postgres (5432) and Redis (6379) are bound to 127.0.0.1 only — never
+# Postgres (5432) and Redis (6379) are bound to 127.0.0.1 only : never
 # exposed externally regardless of firewall settings.
 # =============================================================================
 function Set-CanvasFirewall {
@@ -841,7 +847,7 @@ function Set-CanvasFirewall {
     try {
         New-NetFirewallRule `
             -DisplayName  $ruleName `
-            -Description  "Canvas LMS local development — port $Port" `
+            -Description  "Canvas LMS local development : port $Port" `
             -Direction    Inbound `
             -Protocol     TCP `
             -LocalPort    $Port `
@@ -849,7 +855,7 @@ function Set-CanvasFirewall {
             -Profile      Private, Domain `
             | Out-Null
         Write-Ok "Windows Firewall: inbound TCP $Port allowed (Private + Domain profiles)"
-        Write-Info "Postgres/Redis are bound to 127.0.0.1 — not exposed externally."
+        Write-Info "Postgres/Redis are bound to 127.0.0.1 : not exposed externally."
     } catch {
         Write-Warn "Could not create firewall rule (may need Administrator): $_"
         Write-Warn "Run manually: New-NetFirewallRule -DisplayName '$ruleName' -Direction Inbound -Protocol TCP -LocalPort $Port -Action Allow"
@@ -875,7 +881,7 @@ function Set-CanvasFirewall {
 #
 #   Layer 3 - Task Scheduler task (this step):
 #     Runs "docker compose up -d" at login as a backup and management tool.
-#     docker compose up -d is idempotent — safe to run even if containers
+#     docker compose up -d is idempotent : safe to run even if containers
 #     are already running from Layer 2.
 #
 # Management:

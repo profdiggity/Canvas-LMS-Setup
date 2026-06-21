@@ -1,3 +1,6 @@
+<!-- SPDX-FileCopyrightText: 2026 PrivacySafe Foundation, Inc. -->
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+
 # Canvas LMS Setup Toolkit
 
 > Fully automated Canvas LMS local development setup for Ubuntu GNU/Linux, macOS, and Windows
@@ -52,13 +55,13 @@ The `--mirror` / `-UseMirror` flag routes the git clone through Gitee and Docker
 
 ## What Each Script Does
 
-1. **Checks and installs prerequisites** — Docker, Git, Python 3 (Ubuntu GNU/Linux installs Docker CE from Docker's official APT repo; macOS uses Homebrew + Docker Desktop; Windows checks for Docker Desktop and offers to install Git via winget)
+1. **Checks and installs prerequisites** : Docker, Git, Python 3 (Ubuntu GNU/Linux installs Docker CE from Docker's official APT repo; macOS uses Homebrew + Docker Desktop; Windows checks for Docker Desktop and offers to install Git via winget)
 2. **Clones Canvas LMS** from GitHub (or Gitee mirror)
-3. **Detects the correct postgres image** from Canvas's own Dockerfile — no hardcoded version
-4. **Patches Dockerfiles** for compatibility — adds `[trusted=yes]` to apt repo lines, redirects EOL Debian sources to `archive.debian.org`
-5. **Writes all required config files** — `database.yml`, `security.yml`, `redis.yml`, `cache_store.yml`, `domain.yml`, `outgoing_mail.yml`, `docker-compose.override.yml`
-6. **Builds Docker images** (10–30 min on first run)
-7. **Starts services in the correct order** — postgres and redis first, waits for the canvas database role to be ready, then starts web and jobs
+3. **Detects the correct postgres image** from Canvas's own Dockerfile : no hardcoded version
+4. **Patches Dockerfiles** for compatibility : adds `[trusted=yes]` to apt repo lines, redirects EOL Debian sources to `archive.debian.org`
+5. **Writes all required config files** : `database.yml`, `security.yml`, `redis.yml`, `cache_store.yml`, `domain.yml`, `outgoing_mail.yml`, `docker-compose.override.yml`
+6. **Builds Docker images** (10-30 min on first run)
+7. **Starts services in the correct order** : postgres and redis first, waits for the canvas database role to be ready, then starts web and jobs
 8. **Installs Ruby gems and frontend assets** inside the container
 9. **Creates and seeds the database** with an initial admin account
 10. **Restarts web services** and waits for Passenger to signal ready before declaring success
@@ -76,7 +79,7 @@ The `--mirror` / `-UseMirror` flag routes the git clone through Gitee and Docker
 
 ### Apple Silicon (M1 / M2 / M3)
 
-Canvas's `ruby-passenger` image is amd64-only. The macOS script automatically detects Apple Silicon, adds `platform: linux/amd64` to the compose override, and builds with Rosetta 2 emulation. Builds will take longer than on Intel — this is expected.
+Canvas's `ruby-passenger` image is amd64-only. The macOS script automatically detects Apple Silicon, adds `platform: linux/amd64` to the compose override, and builds with Rosetta 2 emulation. Builds will take longer than on Intel : this is expected.
 
 ## Persistence
 
@@ -109,13 +112,13 @@ All passwords and keys written by these scripts are **placeholders for local dev
 - Changing the admin password after first login
 - Replacing `sekret` (the postgres canvas user password) with a strong password in `config/database.yml` and rebuilding
 - Setting a real SMTP server in `config/outgoing_mail.yml`
-- Never committing `config/security.yml` — the generated encryption key is unique to your installation
+- Never committing `config/security.yml` : the generated encryption key is unique to your installation
 
 ## License
 
-Canvas LMS Setup Toolkit is copyright 2026 PrivacySafe Foundation, Inc. and licensed under the **MIT License**. See [`LICENSE`](LICENSE) for the full text.
+Canvas LMS Setup Toolkit is copyright 2026 PrivacySafe Foundation, Inc. and licensed as **free software** under the **GNU Affero General Public License v3.0 or later** (`AGPL-3.0-or-later`). See [`LICENSE`](LICENSE) for the project license notice and full license reference.
 
-Canvas LMS is open-source software developed by Instructure, Inc. and licensed under the **GNU Affero General Public License v3.0** (AGPL-3.0). Source: https://github.com/instructure/canvas-lms
+Canvas LMS is free software developed by Instructure, Inc. and licensed under the **GNU Affero General Public License v3.0** (AGPL-3.0). Source: https://github.com/instructure/canvas-lms
 
 This toolkit was inspired by original work by swzhang: https://github.com/swzhangf/Canvas-LMS-Setup
 
